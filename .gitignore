@@ -1,0 +1,47 @@
+# ================== Python ==================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ================== Virtual env ==================
+venv/
+.env/
+.env.*
+!.env.example
+
+# ================== IDE ==================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ================== Logs ==================
+*.log
+logs/
+
+# ================== Runtime / Cache ==================
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# ================== Railway ==================
+.railway/
+
+# ================== OS ==================
+Thumbs.db
+
+# ================== Secrets ==================
+*.pem
+*.key
+*.crt
+
+# ================== Docker (если появится) ==================
+docker-compose.override.yml
+.env
