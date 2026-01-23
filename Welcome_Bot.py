@@ -24,13 +24,61 @@ logging.basicConfig(
 )
 
 
-VERSION = "1.2.16"
+# ================== VERSION ==================
+VERSION = "1.3.17"
+# v1.3.17 — Text polish
+# ================== FEATURE FLAGS (1.3.x) ==================
+# ================== FEATURE FLAGS (1.3.x) ==================
+FEATURE_WELCOME_ENABLED = True
+FEATURE_MUTE_ENABLED = True
+FEATURE_AUTODELETE_ENABLED = True
+
+# ================== FEATURE STATE (1.3.5) ==================
+FEATURE_STATE = {
+    "welcome": True,
+    "mute": True,
+    "autodelete": True,
+}
+
+
+# ================== FEATURE STORE ABSTRACTION (1.3.8) ==================
+class FeatureStore:
+    def load(self) -> dict:
+        raise NotImplementedError
+
+    def save(self, state: dict):
+        raise NotImplementedError
+
+
+class InMemoryFeatureStore(FeatureStore):
+    def load(self) -> dict:
+        return FEATURE_STATE.copy()
+
+    def save(self, state: dict):
+        FEATURE_STATE.update(state)
+
+
+FEATURE_STORE = InMemoryFeatureStore()
+
+def sync_feature_flags():
+    global FEATURE_WELCOME_ENABLED, FEATURE_MUTE_ENABLED, FEATURE_AUTODELETE_ENABLED
+    FEATURE_WELCOME_ENABLED = FEATURE_STATE["welcome"]
+    FEATURE_MUTE_ENABLED = FEATURE_STATE["mute"]
+    FEATURE_AUTODELETE_ENABLED = FEATURE_STATE["autodelete"]
+    FEATURE_STORE.save(FEATURE_STATE)
+# ===========================================================
 # FEATURE:
 # Welcome message supports optional image via WELCOME_IMAGE_URL
 # FINAL RELEASE:
 # Версия 1.2.15 является финальной.
 # Ветка 1.2.x официально закрыта.
 # Допускаются только критические security-fix при необходимости.
+
+# ================== RELEASE STATUS ==================
+# Version 1.3.9
+# Branch 1.3.x frozen
+# Only critical fixes allowed
+# ================================================
 
 START_TIME = time.time()
 
@@ -48,8 +96,6 @@ class Config:
     welcome_delay_seconds: int
     faq_url: str | None
     support_url: str | None
-    welcome_message_ttl: int
-    rules_message_ttl: int
     bot_mode: str
     welcome_image_url: str | None
 
@@ -78,12 +124,6 @@ def load_config() -> Config:
         welcome_delay_seconds = int(os.getenv("WELCOME_DELAY_SECONDS", "3"))
     except ValueError:
         raise RuntimeError("WELCOME_DELAY_SECONDS должен быть числом")
-
-    try:
-        welcome_message_ttl = int(os.getenv("WELCOME_MESSAGE_TTL", "180"))
-        rules_message_ttl = int(os.getenv("RULES_MESSAGE_TTL", "300"))
-    except ValueError:
-        raise RuntimeError("WELCOME_MESSAGE_TTL и RULES_MESSAGE_TTL должны быть числами")
 
     mute_new_users = _env_bool("MUTE_NEW_USERS", True)
 
@@ -130,14 +170,16 @@ def load_config() -> Config:
         welcome_delay_seconds=welcome_delay_seconds,
         faq_url=faq_url,
         support_url=support_url,
-        welcome_message_ttl=welcome_message_ttl,
-        rules_message_ttl=rules_message_ttl,
         bot_mode=bot_mode,
         welcome_image_url=welcome_image_url,
     )
 # ================================================
 
+
 CFG = load_config()
+
+# ===== Unified UX timing for admin/test UX messages =====
+UX_TTL_SECONDS = 60
 
 # ================== RUNTIME STATE ==================
 # user_id -> last_welcome_timestamp
@@ -166,17 +208,10 @@ TEXTS = {
     "ru": {
         "welcome": (
             "👋 <b>Добро пожаловать в закрытое Telegram-сообщество проекта {project}</b>\n\n"
-            "Сообщество предназначено для профессионального общения и получения актуальной информации "
-            "по продуктам <b>Apple</b>, операционным системам <b>Apple</b> и <b>Microsoft</b>, "
-            "а также по программному обеспечению.\n\n"
-            "Здесь вы найдёте:\n"
-            "• экспертную аналитику и технологические обзоры\n"
-            "• тестирование решений и разборы ошибок\n"
-            "• практические рекомендации и решения проблем с программным обеспечением\n"
-            "• ответы на технические вопросы и индивидуальную техническую поддержку\n\n"
-            "Сообщество создано для обмена опытом, обсуждения обновлений и получения проверенной информации "
-            "по технологиям и продуктам проекта.\n\n"
-            "<b>Спасибо за подписку. Оставайтесь с нами.</b>\n\n"
+            "Сообщество предназначено для общения по вопросам\n"
+            "настройки, использования, тестирования и устранения проблем\n"
+            "в программном обеспечении и операционных системах Apple и Microsoft.\n\n"
+            "Спасибо за подписку. Оставайтесь с нами.\n\n"
             "⬇️ <i>Выберите действие ниже.</i>"
         ),
         "rules": (
@@ -204,17 +239,46 @@ TEXTS = {
         "btn_storage": "📦 Хранилище",
         "btn_rules": "📜 Правила",
         "health_ok": "✅ <b>Welcome Bot — OK</b>",
+        # Admin panel localization
+        "admin_panel_title": "⚙️ <b>Панель управления Welcome Bot</b>",
+        "admin_no_access": "⛔ Нет доступа",
+        "admin_welcome_on": "✅ Welcome-сообщения включены",
+        "admin_welcome_off": "⛔ Welcome-сообщения отключены",
+        "admin_mute_on": "✅ Mute новых пользователей включён",
+        "admin_mute_off": "⛔ Mute новых пользователей отключён",
+        "admin_autodelete_on": "✅ Auto-delete включён",
+        "admin_autodelete_off": "⛔ Auto-delete отключён",
+        # v1.3.4 — about
+        "about": (
+            "ℹ️ <b>О сообществе Technology Universe</b>\n\n"
+            "Здесь вы найдёте:\n\n"
+            "• экспертную аналитику и технологические обзоры\n"
+            "• тестирование решений и разборы ошибок\n"
+            "• практические рекомендации и помощь в решении проблем\n"
+            "• ответы на технические вопросы и индивидуальную поддержку\n\n"
+            "Сообщество создано для обмена опытом, обсуждения обновлений\n"
+            "и получения проверенной информации по технологиям\n"
+            "и продуктам проекта."
+        ),
+        "btn_about": "ℹ️ О сообществе",
+        # v1.3.6 — admin state/UX
+        "state_on": "Включено ✅",
+        "state_off": "Выключено ⛔",
+        "ux_welcome_on": "Welcome-сообщения включены",
+        "ux_welcome_off": "Welcome-сообщения отключены",
+        "ux_mute_on": "Mute новых пользователей включён",
+        "ux_mute_off": "Mute новых пользователей отключён",
+        "ux_autodelete_on": "Auto-delete включён",
+        "ux_autodelete_off": "Auto-delete отключён",
     },
     "en": {
         "welcome": (
-            "👋 <b>Welcome, {name}!</b>\n\n"
-            "You have joined the official community of "
-            "<b>{project}</b>.\n\n"
-            "📌 <b>About this chat:</b>\n"
-            "• Updates and releases discussion\n"
-            "• Technical support\n"
-            "• Official information\n\n"
-            "Choose an option below ⬇️"
+            "👋 <b>Welcome to the private Telegram community of the Technology Universe project</b>\n\n"
+            "This community is intended for discussions about\n"
+            "setup, usage, testing, and troubleshooting\n"
+            "software and operating systems by Apple and Microsoft.\n\n"
+            "Thank you for joining. Stay with us.\n\n"
+            "⬇️ <i>Choose an option below.</i>"
         ),
         "rules": (
             "📜 <b>Chat rules:</b>\n\n"
@@ -227,6 +291,37 @@ TEXTS = {
         "btn_storage": "📦 Storage",
         "btn_rules": "📜 Rules",
         "health_ok": "✅ <b>Welcome Bot — OK</b>",
+        # Admin panel localization
+        "admin_panel_title": "⚙️ <b>Welcome Bot Control Panel</b>",
+        "admin_no_access": "⛔ Access denied",
+        "admin_welcome_on": "✅ Welcome messages enabled",
+        "admin_welcome_off": "⛔ Welcome messages disabled",
+        "admin_mute_on": "✅ New user mute enabled",
+        "admin_mute_off": "⛔ New user mute disabled",
+        "admin_autodelete_on": "✅ Auto-delete enabled",
+        "admin_autodelete_off": "⛔ Auto-delete disabled",
+        # v1.3.4 — about
+        "about": (
+            "ℹ️ <b>About Technology Universe</b>\n\n"
+            "Here you will find:\n\n"
+            "• expert analytics and technology reviews\n"
+            "• solution testing and issue breakdowns\n"
+            "• practical recommendations and troubleshooting assistance\n"
+            "• answers to technical questions and individual support\n\n"
+            "This community is created for experience sharing,\n"
+            "update discussions, and access to verified information\n"
+            "about technologies and project products."
+        ),
+        "btn_about": "ℹ️ About",
+        # v1.3.6 — admin state/UX
+        "state_on": "Enabled ✅",
+        "state_off": "Disabled ⛔",
+        "ux_welcome_on": "Welcome messages enabled",
+        "ux_welcome_off": "Welcome messages disabled",
+        "ux_mute_on": "New user mute enabled",
+        "ux_mute_off": "New user mute disabled",
+        "ux_autodelete_on": "Auto-delete enabled",
+        "ux_autodelete_off": "Auto-delete disabled",
     },
 }
 # ================================================
@@ -271,6 +366,62 @@ def is_test_mode() -> bool:
     return CFG.bot_mode == "test"
 
 
+# Unified TTL helper for UX messages (v1.3.16)
+def get_message_ttl(msg_type: str) -> int:
+    if is_test_mode():
+        return 60
+    return 300
+
+
+# Ограничение доступа к /control
+def is_control_allowed(message: Message) -> bool:
+    # /control разрешён всегда в личке
+    if message.chat.type == "private":
+        return True
+    # В группах — только если чат разрешён
+    return is_allowed_chat(message.chat.id)
+
+
+# Admin reply helper
+async def admin_reply(message: Message, text: str):
+    if not is_test_mode():
+        return
+
+    msg = await message.answer(text)
+
+    async with BOT_MESSAGES_LOCK:
+        BOT_MESSAGES[msg.message_id] = (time.time(), "admin")
+        BOT_MESSAGES_CHAT_ID[msg.message_id] = message.chat.id
+
+
+def admin_control_keyboard(lang: str) -> InlineKeyboardMarkup:
+    def state(flag: bool) -> str:
+        return t(lang, "state_on") if flag else t(lang, "state_off")
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Welcome: {state(FEATURE_WELCOME_ENABLED)}", callback_data="admin:welcome")],
+        [InlineKeyboardButton(text=f"Mute: {state(FEATURE_MUTE_ENABLED)}", callback_data="admin:mute")],
+        [InlineKeyboardButton(text=f"Auto-delete: {state(FEATURE_AUTODELETE_ENABLED)}", callback_data="admin:autodelete")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh")]
+    ])
+@dp.message(F.text == "/control")
+async def admin_control_panel(message: Message):
+    if not is_control_allowed(message):
+        return
+    if not message.from_user:
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer(t(detect_lang(message.from_user.language_code), "admin_no_access"))
+        return
+
+    lang = detect_lang(message.from_user.language_code)
+    await message.answer(
+        t(lang, "admin_panel_title"),
+        reply_markup=admin_control_keyboard(lang)
+    )
+
+
+
 def detect_lang(user_lang: str | None) -> str:
     if not user_lang:
         return DEFAULT_LANG
@@ -288,10 +439,16 @@ def welcome_keyboard(lang: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text=t(lang, "btn_storage"),
                 url=CFG.storage_url
-            ),
+            )
+        ],
+        [
             InlineKeyboardButton(
                 text=t(lang, "btn_rules"),
                 callback_data=f"rules:{lang}"
+            ),
+            InlineKeyboardButton(
+                text=t(lang, "btn_about"),
+                callback_data=f"about:{lang}"
             )
         ]
     ]
@@ -306,6 +463,31 @@ def welcome_keyboard(lang: str) -> InlineKeyboardMarkup:
         buttons.append(extra)
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# v1.3.4 — show_about callback
+@dp.callback_query(F.data.startswith("about:"))
+async def show_about(callback: CallbackQuery):
+    if not callback.message or not callback.from_user:
+        return
+
+    try:
+        await callback.answer()
+    except Exception:
+        return
+
+    data = callback.data or ""
+    parts = data.split(":", 1)
+    lang = parts[1] if len(parts) == 2 else DEFAULT_LANG
+    text = t(lang, "about")
+
+    if is_test_mode():
+        text = "🧪 <i>Test mode</i>\n\n" + text
+
+    msg = await callback.message.answer(text)
+
+    async with BOT_MESSAGES_LOCK:
+        BOT_MESSAGES[msg.message_id] = (time.time(), "about")
+        BOT_MESSAGES_CHAT_ID[msg.message_id] = callback.message.chat.id
 
 
 def is_paid_like_chat(message: Message) -> bool:
@@ -374,7 +556,8 @@ async def welcome_new_user(message: Message):
             logging.warning("CACHE | WELCOME_CACHE cleared (limit exceeded)")
 
         if (
-            CFG.mute_new_users
+            FEATURE_MUTE_ENABLED
+            and CFG.mute_new_users
             and perms["restrict"]
             and not is_test_mode()
             and not paid_like
@@ -399,47 +582,49 @@ async def welcome_new_user(message: Message):
                     f"MUTE FAILED | user={user.id} | error={e}"
                 )
 
-        logging.info(
-            f"WELCOME | user={user.id}"
-        )
-
-        lang = detect_lang(user.language_code)
-        safe_name = user.full_name or "User"
-        text = t(lang, "welcome").format(
-            name=safe_name,
-            project=CFG.project_name
-        )
-
-        if is_test_mode():
-            text = "🧪 <i>Test mode</i>\n\n" + text
-
-        if CFG.welcome_delay_seconds > 0:
-            await asyncio.sleep(CFG.welcome_delay_seconds)
-
-        if CFG.welcome_image_url:
-            msg = await bot.send_photo(
-                chat_id=message.chat.id,
-                photo=CFG.welcome_image_url,
-                caption=text,
-                reply_markup=welcome_keyboard(lang)
-            )
-        else:
-            msg = await message.answer(
-                text,
-                reply_markup=welcome_keyboard(lang)
+        if FEATURE_WELCOME_ENABLED:
+            logging.info(
+                f"WELCOME | user={user.id}"
             )
 
-        async with BOT_MESSAGES_LOCK:
-            BOT_MESSAGES[msg.message_id] = (time.time(), "welcome")
-            BOT_MESSAGES_CHAT_ID[msg.message_id] = message.chat.id
+            lang = detect_lang(user.language_code)
+            safe_name = user.full_name or "User"
+            text = t(lang, "welcome").format(
+                name=safe_name,
+                project=CFG.project_name
+            )
 
-        if (
-            CFG.auto_delete_seconds > 0
-            and not is_test_mode()
-            and not paid_like
-        ):
-            await asyncio.sleep(CFG.auto_delete_seconds)
-            await msg.delete()
+            if is_test_mode():
+                text = "🧪 <i>Test mode</i>\n\n" + text
+
+            if CFG.welcome_delay_seconds > 0:
+                await asyncio.sleep(CFG.welcome_delay_seconds)
+
+            if CFG.welcome_image_url:
+                msg = await bot.send_photo(
+                    chat_id=message.chat.id,
+                    photo=CFG.welcome_image_url,
+                    caption=text,
+                    reply_markup=welcome_keyboard(lang)
+                )
+            else:
+                msg = await message.answer(
+                    text,
+                    reply_markup=welcome_keyboard(lang)
+                )
+
+            async with BOT_MESSAGES_LOCK:
+                BOT_MESSAGES[msg.message_id] = (time.time(), "welcome")
+                BOT_MESSAGES_CHAT_ID[msg.message_id] = message.chat.id
+
+            if (
+                FEATURE_AUTODELETE_ENABLED
+                and CFG.auto_delete_seconds > 0
+                and not is_test_mode()
+                and not paid_like
+            ):
+                await asyncio.sleep(CFG.auto_delete_seconds)
+                await msg.delete()
 
 
 
@@ -455,7 +640,8 @@ async def show_rules(callback: CallbackQuery):
     except Exception:
         return
 
-    parts = callback.data.split(":", 1)
+    data = callback.data or ""
+    parts = data.split(":", 1)
     lang = parts[1] if len(parts) == 2 else DEFAULT_LANG
 
     user_id = callback.from_user.id
@@ -482,6 +668,62 @@ async def show_rules(callback: CallbackQuery):
         BOT_MESSAGES_CHAT_ID[msg.message_id] = callback.message.chat.id
 
 
+@dp.callback_query(F.data.startswith("admin:"))
+async def admin_control_callback(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        try:
+            lang = detect_lang(callback.from_user.language_code)
+            await callback.answer(t(lang, "admin_no_access"), show_alert=True)
+        except Exception:
+            pass
+        return
+
+    lang = detect_lang(callback.from_user.language_code)
+    global FEATURE_WELCOME_ENABLED, FEATURE_MUTE_ENABLED, FEATURE_AUTODELETE_ENABLED
+
+    data = callback.data or ""
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        return
+    action = parts[1]
+
+    if action == "welcome":
+        FEATURE_STATE["welcome"] = not FEATURE_STATE["welcome"]
+        sync_feature_flags()
+        if is_test_mode():
+            await callback.answer(t(lang, "ux_welcome_on") if FEATURE_STATE["welcome"] else t(lang, "ux_welcome_off"))
+        else:
+            await callback.answer()
+    elif action == "mute":
+        FEATURE_STATE["mute"] = not FEATURE_STATE["mute"]
+        sync_feature_flags()
+        if is_test_mode():
+            await callback.answer(t(lang, "ux_mute_on") if FEATURE_STATE["mute"] else t(lang, "ux_mute_off"))
+        else:
+            await callback.answer()
+    elif action == "autodelete":
+        FEATURE_STATE["autodelete"] = not FEATURE_STATE["autodelete"]
+        sync_feature_flags()
+        if is_test_mode():
+            await callback.answer(t(lang, "ux_autodelete_on") if FEATURE_STATE["autodelete"] else t(lang, "ux_autodelete_off"))
+        else:
+            await callback.answer()
+    elif action == "refresh":
+        # No UX response for refresh
+        await callback.answer()  # Always safe to call, no text
+
+    # Fix for Pylance: only call edit_reply_markup if Message, not InaccessibleMessage
+    if callback.message and isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=admin_control_keyboard(lang)
+            )
+        except Exception as e:
+            # Ignore Telegram error when markup is not changed
+            if "message is not modified" not in str(e):
+                raise
+
+
 
 @dp.message(F.text == "/version")
 async def version_cmd(message: Message):
@@ -490,7 +732,7 @@ async def version_cmd(message: Message):
     await message.answer(
         "ℹ️ <b>Welcome Bot</b>\n"
         f"Version: {VERSION}\n"
-        "Channel: Stable (1.2.x)"
+        "Channel: Stable (1.3.x)"
     )
 
 
@@ -535,6 +777,86 @@ async def health_check(message: Message):
             text += f"• {w}\n"
 
     await message.answer(text)
+
+
+# ===== Admin Control Commands =====
+
+@dp.message(F.text.startswith("/welcome "))
+async def welcome_toggle(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await admin_reply(message, "ℹ️ Использование: /welcome on|off")
+        return
+
+    arg = parts[1].lower()
+    lang = detect_lang(message.from_user.language_code)
+
+    if arg == "on":
+        FEATURE_STATE["welcome"] = True
+        sync_feature_flags()
+        await admin_reply(message, t(lang, "admin_welcome_on"))
+    elif arg == "off":
+        FEATURE_STATE["welcome"] = False
+        sync_feature_flags()
+        await admin_reply(message, t(lang, "admin_welcome_off"))
+    else:
+        await admin_reply(message, "ℹ️ Использование: /welcome on|off")
+
+
+@dp.message(F.text.startswith("/mute "))
+async def mute_toggle(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await admin_reply(message, "ℹ️ Использование: /mute on|off")
+        return
+
+    arg = parts[1].lower()
+    lang = detect_lang(message.from_user.language_code)
+
+    if arg == "on":
+        FEATURE_STATE["mute"] = True
+        sync_feature_flags()
+        await admin_reply(message, t(lang, "admin_mute_on"))
+    elif arg == "off":
+        FEATURE_STATE["mute"] = False
+        sync_feature_flags()
+        await admin_reply(message, t(lang, "admin_mute_off"))
+    else:
+        await admin_reply(message, "ℹ️ Использование: /mute on|off")
+
+
+@dp.message(F.text.startswith("/autodelete "))
+async def autodelete_toggle(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await admin_reply(message, "ℹ️ Использование: /autodelete on|off")
+        return
+
+    arg = parts[1].lower()
+    lang = detect_lang(message.from_user.language_code)
+
+    if arg == "on":
+        FEATURE_STATE["autodelete"] = True
+        sync_feature_flags()
+        await admin_reply(message, t(lang, "admin_autodelete_on"))
+    elif arg == "off":
+        FEATURE_STATE["autodelete"] = False
+        sync_feature_flags()
+        await admin_reply(message, t(lang, "admin_autodelete_off"))
+    else:
+        await admin_reply(message, "ℹ️ Использование: /autodelete on|off")
 @dp.message(F.text.startswith("/"))
 async def unknown_command(message: Message):
     if not message.from_user:
@@ -543,7 +865,7 @@ async def unknown_command(message: Message):
     if is_admin(message.from_user.id):
         await message.answer(
             "ℹ️ Неизвестная команда\n"
-            "Используйте /health или /version"
+            "Используйте /health, /version или /control"
         )
 
 
@@ -554,11 +876,7 @@ async def cleanup_bot_messages():
 
         async with BOT_MESSAGES_LOCK:
             for msg_id, (ts, msg_type) in BOT_MESSAGES.items():
-                ttl = (
-                    CFG.welcome_message_ttl
-                    if msg_type == "welcome"
-                    else CFG.rules_message_ttl
-                )
+                ttl = get_message_ttl(msg_type)
                 if (now - ts) > ttl:
                     to_delete.append(msg_id)
 
@@ -586,14 +904,14 @@ async def cleanup_caches():
 
         try:
             # welcome cache
-            for user_id, ts in list(WELCOME_CACHE.items()):
-                if (now - ts) > WELCOME_TTL_SECONDS:
-                    WELCOME_CACHE.pop(user_id, None)
+            expired = [uid for uid, ts in WELCOME_CACHE.items() if (now - ts) > WELCOME_TTL_SECONDS]
+            for uid in expired:
+                WELCOME_CACHE.pop(uid, None)
 
             # rules cache
-            for user_id, ts in list(RULES_CACHE.items()):
-                if (now - ts) > RULES_TTL_SECONDS:
-                    RULES_CACHE.pop(user_id, None)
+            expired = [uid for uid, ts in RULES_CACHE.items() if (now - ts) > RULES_TTL_SECONDS]
+            for uid in expired:
+                RULES_CACHE.pop(uid, None)
         except Exception as e:
             logging.warning(f"CACHE | cleanup failed | error={e}")
 
@@ -613,13 +931,12 @@ async def main():
         f"delay={CFG.welcome_delay_seconds}s "
         f"autodelete={CFG.auto_delete_seconds}s"
     )
-    logging.info(f"BUILD | version={VERSION} channel=stable")
+    logging.info(f"BUILD | version={VERSION} channel=stable-1.3.x")
     if not CFG.admin_ids:
         logging.warning("ENV | ADMIN_IDS is empty")
 
     if not CFG.allowed_chat_ids:
         logging.warning("ENV | ALLOWED_CHAT_IDS is empty (bot allowed in all chats)")
-    logging.info(f"FINAL | {VERSION} production ready (official final)")
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -629,9 +946,9 @@ async def main():
     logging.info("RUNTIME | async lifecycle guards enabled")
     tasks = []
 
-    if not is_test_mode():
-        tasks.append(asyncio.create_task(cleanup_bot_messages()))
-        tasks.append(asyncio.create_task(cleanup_caches()))
+    # Cleanup tasks enabled in all modes (safe for test-mode)
+    tasks.append(asyncio.create_task(cleanup_bot_messages()))
+    tasks.append(asyncio.create_task(cleanup_caches()))
 
     polling = asyncio.create_task(dp.start_polling(bot))
     tasks.append(polling)
