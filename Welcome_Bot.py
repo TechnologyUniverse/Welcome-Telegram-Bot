@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 
 
-VERSION = "1.2.15"
+VERSION = "1.2.16"
 # FEATURE:
 # Welcome message supports optional image via WELCOME_IMAGE_URL
 # FINAL RELEASE:
@@ -87,12 +87,27 @@ def load_config() -> Config:
 
     mute_new_users = _env_bool("MUTE_NEW_USERS", True)
 
-    admin_ids = {
-        int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
-    }
-    allowed_chat_ids = {
-        int(x) for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if x.strip().isdigit()
-    }
+    admin_ids: set[int] = set()
+    raw_admin_ids = os.getenv("ADMIN_IDS", "")
+    for x in raw_admin_ids.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            admin_ids.add(int(x))
+        except ValueError:
+            logging.warning(f"ENV | invalid admin id ignored: {x}")
+
+    allowed_chat_ids: set[int] = set()
+    raw_chat_ids = os.getenv("ALLOWED_CHAT_IDS", "")
+    for x in raw_chat_ids.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            allowed_chat_ids.add(int(x))
+        except ValueError:
+            logging.warning(f"ENV | invalid chat id ignored: {x}")
 
     faq_url = os.getenv("FAQ_URL")
     support_url = os.getenv("SUPPORT_URL")
