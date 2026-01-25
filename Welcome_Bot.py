@@ -6,7 +6,8 @@ from aiogram.types import (
     Message,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    CallbackQuery
+    CallbackQuery,
+    ChatMemberUpdated
 )
 from aiogram.types import ChatPermissions
 from aiogram.enums import ParseMode
@@ -25,8 +26,8 @@ logging.basicConfig(
 
 
 # ================== VERSION ==================
-VERSION = "1.3.17"
-# v1.3.17 — Text polish
+VERSION = "1.3.9.18"
+# v1.3.9.18 — Welcome for invite link & paid join approval
 # ================== FEATURE FLAGS (1.3.x) ==================
 # ================== FEATURE FLAGS (1.3.x) ==================
 FEATURE_WELCOME_ENABLED = True
@@ -625,6 +626,62 @@ async def welcome_new_user(message: Message):
             ):
                 await asyncio.sleep(CFG.auto_delete_seconds)
                 await msg.delete()
+
+
+# --- v1.3.9.18: Welcome for invite link & paid join approval ---
+@dp.chat_member()
+async def welcome_on_approved_join(event: ChatMemberUpdated):
+    """
+    Welcome users who joined via:
+    - invite link
+    - paid / join request approval
+    """
+    if event.old_chat_member.status in {"left", "kicked"} and event.new_chat_member.status == "member":
+        user = event.new_chat_member.user
+        chat = event.chat
+
+        # Проверка разрешённого чата
+        if not is_allowed_chat(chat.id):
+            logging.info(f"SKIP approved join | chat_id={chat.id} | not allowed")
+            return
+
+        # Антидубль (используем тот же cache)
+        now = time.time()
+        last_time = WELCOME_CACHE.get(user.id)
+        if last_time and (now - last_time) < WELCOME_TTL_SECONDS:
+            logging.info(f"SKIP approved welcome | user={user.id} | duplicate")
+            return
+
+        WELCOME_CACHE[user.id] = now
+        if len(WELCOME_CACHE) > WELCOME_CACHE_MAX:
+            WELCOME_CACHE.clear()
+            logging.warning("CACHE | WELCOME_CACHE cleared (limit exceeded)")
+
+        if not FEATURE_WELCOME_ENABLED:
+            return
+
+        lang = detect_lang(user.language_code)
+        text = t(lang, "welcome").format(
+            name=user.full_name or "User",
+            project=CFG.project_name
+        )
+
+        if is_test_mode():
+            text = "🧪 <i>Test mode</i>\n\n" + text
+
+        try:
+            msg = await bot.send_message(
+                chat_id=chat.id,
+                text=text,
+                reply_markup=welcome_keyboard(lang)
+            )
+
+            async with BOT_MESSAGES_LOCK:
+                BOT_MESSAGES[msg.message_id] = (time.time(), "welcome")
+                BOT_MESSAGES_CHAT_ID[msg.message_id] = chat.id
+
+        except Exception as e:
+            logging.warning(f"WELCOME APPROVED FAILED | user={user.id} | error={e}")
 
 
 
