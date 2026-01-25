@@ -16,6 +16,7 @@ import logging
 import time
 from dataclasses import dataclass
 import signal
+from typing import cast
 
 load_dotenv()
 
@@ -26,8 +27,24 @@ logging.basicConfig(
 
 
 # ================== VERSION ==================
-VERSION = "1.3.9.18"
-# v1.3.9.18 — Welcome for invite link & paid join approval
+VERSION = "1.4.9.02"
+# v1.4.9.02 — Fix Pylance ConvertibleToInt (TypedDict registry)
+
+# ================== 1.4.5 UX & FLOOD SAFETY ==================
+# Simple single-instance lock to avoid parallel polling
+LOCK_FILE = "/tmp/welcome_bot.lock"
+# =============================================================
+def acquire_startup_lock() -> bool:
+    if os.path.exists(LOCK_FILE):
+        logging.error("STARTUP | lock exists, another instance is running")
+        return False
+    try:
+        with open(LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+    except Exception as e:
+        logging.error(f"STARTUP | failed to create lock | error={e}")
+        return False
 # ================== FEATURE FLAGS (1.3.x) ==================
 # ================== FEATURE FLAGS (1.3.x) ==================
 FEATURE_WELCOME_ENABLED = True
@@ -193,6 +210,19 @@ RULES_CACHE: dict[int, float] = {}
 RULES_CACHE_MAX = 10_000
 RULES_TTL_SECONDS = 300  # 5 минут антиспам для правил
 # ================================================
+
+from typing import TypedDict, Set
+
+# ================== USER REGISTRY (1.4.1) ==================
+# user_id -> {"source": str, "labels": set[str], "first_seen": float, "chat_id": int}
+class UserRegistryItem(TypedDict):
+    source: str
+    labels: Set[str]
+    first_seen: float
+    chat_id: int
+
+USER_REGISTRY: dict[int, UserRegistryItem] = {}
+# ===========================================================
 
 # bot_message_id -> (timestamp, message_type)
 BOT_MESSAGES: dict[int, tuple[float, str]] = {}
@@ -380,7 +410,7 @@ def is_control_allowed(message: Message) -> bool:
     if message.chat.type == "private":
         return True
     # В группах — только если чат разрешён
-    return is_allowed_chat(message.chat.id)
+    return is_allowed_chat(cast(int, message.chat.id))
 
 
 # Admin reply helper
@@ -392,7 +422,7 @@ async def admin_reply(message: Message, text: str):
 
     async with BOT_MESSAGES_LOCK:
         BOT_MESSAGES[msg.message_id] = (time.time(), "admin")
-        BOT_MESSAGES_CHAT_ID[msg.message_id] = message.chat.id
+        BOT_MESSAGES_CHAT_ID[cast(int, msg.message_id)] = cast(int, message.chat.id)
 
 
 def admin_control_keyboard(lang: str) -> InlineKeyboardMarkup:
@@ -488,7 +518,7 @@ async def show_about(callback: CallbackQuery):
 
     async with BOT_MESSAGES_LOCK:
         BOT_MESSAGES[msg.message_id] = (time.time(), "about")
-        BOT_MESSAGES_CHAT_ID[msg.message_id] = callback.message.chat.id
+        BOT_MESSAGES_CHAT_ID[cast(int, msg.message_id)] = cast(int, callback.message.chat.id)
 
 
 def is_paid_like_chat(message: Message) -> bool:
@@ -503,17 +533,34 @@ def is_paid_like_chat(message: Message) -> bool:
         or getattr(chat, "join_to_send_messages", False)
     )
 
+# Helper: detect join source from message (1.4.3)
+def detect_join_source_from_message(message: Message) -> str:
+    source = "telegram"
+
+    invite = getattr(message, "invite_link", None)
+    if invite:
+        name = (invite.name or "").lower()
+        if "discord" in name:
+            source = "discord"
+        else:
+            source = "invite_link"
+
+    if getattr(message.chat, "join_by_request", False):
+        source = "request"
+
+    return source
+
 
 @dp.message(F.new_chat_members)
 async def welcome_new_user(message: Message):
     # Проверка разрешённого чата
-    if not is_allowed_chat(message.chat.id):
+    if not is_allowed_chat(cast(int, message.chat.id)):
         logging.info(
             f"SKIP chat | chat_id={message.chat.id} | not allowed"
         )
         return
 
-    perms = await bot_has_permissions(message.chat.id)
+    perms = await bot_has_permissions(cast(int, message.chat.id))
 
     paid_like = is_paid_like_chat(message)
 
@@ -538,6 +585,16 @@ async def welcome_new_user(message: Message):
     if not message.new_chat_members:
         return
 
+    # --- 1.4.1: detect join source
+    source = detect_join_source_from_message(message)
+    logging.info(
+        f"JOIN_SOURCE | user={getattr(message.from_user, 'id', '?')} | source={source}"
+    )
+    if source.startswith("discord"):
+        logging.info(
+            f"DISCORD_USER | user={getattr(message.from_user, 'id', '?')} | chat={message.chat.id}"
+        )
+
     for user in message.new_chat_members:
         if user.is_bot:
             continue
@@ -556,6 +613,24 @@ async def welcome_new_user(message: Message):
             WELCOME_CACHE.clear()
             logging.warning("CACHE | WELCOME_CACHE cleared (limit exceeded)")
 
+        # --- 1.4.2: user registry with chat_id
+        if user.id not in USER_REGISTRY:
+            labels: Set[str] = set()
+            if source.startswith("discord"):
+                labels.add("discord_member")
+            if paid_like:
+                labels.add("paid_member")
+
+            USER_REGISTRY[user.id] = {
+                "source": source,
+                "labels": labels,
+                "first_seen": now,
+                "chat_id": cast(int, message.chat.id)
+            }
+            logging.info(
+                f"USER_JOIN | user={user.id} | source={source}"
+            )
+
         if (
             FEATURE_MUTE_ENABLED
             and CFG.mute_new_users
@@ -565,15 +640,15 @@ async def welcome_new_user(message: Message):
         ):
             try:
                 await bot.restrict_chat_member(
-                    chat_id=message.chat.id,
-                    user_id=user.id,
+                    chat_id=cast(int, message.chat.id),
+                    user_id=cast(int, user.id),
                     permissions=ChatPermissions(
                         can_send_messages=False,
                         can_send_media_messages=False,
                         can_send_other_messages=False,
                         can_add_web_page_previews=False
                     ),
-                    until_date=int(time.time()) + CFG.mute_seconds
+                    until_date=int(time.time()) + int(CFG.mute_seconds)
                 )
                 logging.info(
                     f"MUTED | user={user.id} | seconds={CFG.mute_seconds}"
@@ -594,16 +669,25 @@ async def welcome_new_user(message: Message):
                 name=safe_name,
                 project=CFG.project_name
             )
+            if (not is_test_mode()) and source.startswith("discord"):
+                text = (
+                    text
+                    + "\n\n<i>Вы получили доступ как участник Discord‑сообщества проекта.</i>"
+                )
 
             if is_test_mode():
-                text = "🧪 <i>Test mode</i>\n\n" + text
+                text = (
+                    "🧪 <i>Test mode</i>\n"
+                    f"🧪 <i>Source: {source}</i>\n\n"
+                    + text
+                )
 
             if CFG.welcome_delay_seconds > 0:
-                await asyncio.sleep(CFG.welcome_delay_seconds)
+                await asyncio.sleep(float(CFG.welcome_delay_seconds))
 
             if CFG.welcome_image_url:
                 msg = await bot.send_photo(
-                    chat_id=message.chat.id,
+                    chat_id=cast(int, message.chat.id),
                     photo=CFG.welcome_image_url,
                     caption=text,
                     reply_markup=welcome_keyboard(lang)
@@ -616,7 +700,7 @@ async def welcome_new_user(message: Message):
 
             async with BOT_MESSAGES_LOCK:
                 BOT_MESSAGES[msg.message_id] = (time.time(), "welcome")
-                BOT_MESSAGES_CHAT_ID[msg.message_id] = message.chat.id
+                BOT_MESSAGES_CHAT_ID[cast(int, msg.message_id)] = cast(int, message.chat.id)
 
             if (
                 FEATURE_AUTODELETE_ENABLED
@@ -624,7 +708,7 @@ async def welcome_new_user(message: Message):
                 and not is_test_mode()
                 and not paid_like
             ):
-                await asyncio.sleep(CFG.auto_delete_seconds)
+                await asyncio.sleep(float(CFG.auto_delete_seconds))
                 await msg.delete()
 
 
@@ -636,12 +720,15 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
     - invite link
     - paid / join request approval
     """
+    # --- 1.4.1: detect join source from event
+    source = detect_join_source_from_member_event(event)
+
     if event.old_chat_member.status in {"left", "kicked"} and event.new_chat_member.status == "member":
         user = event.new_chat_member.user
         chat = event.chat
 
         # Проверка разрешённого чата
-        if not is_allowed_chat(chat.id):
+        if not is_allowed_chat(cast(int, chat.id)):
             logging.info(f"SKIP approved join | chat_id={chat.id} | not allowed")
             return
 
@@ -657,6 +744,28 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
             WELCOME_CACHE.clear()
             logging.warning("CACHE | WELCOME_CACHE cleared (limit exceeded)")
 
+        # --- 1.4.2: user registry with chat_id
+        if user.id not in USER_REGISTRY:
+            labels: Set[str] = set()
+            if source.startswith("discord"):
+                labels.add("discord_member")
+            if source == "paid":
+                labels.add("paid_member")
+
+            USER_REGISTRY[user.id] = {
+                "source": source,
+                "labels": labels,
+                "first_seen": now,
+                "chat_id": cast(int, chat.id)
+            }
+            logging.info(
+                f"USER_JOIN | user={user.id} | source={source}"
+            )
+            if source.startswith("discord"):
+                logging.info(
+                    f"DISCORD_USER | user={user.id} | chat={chat.id}"
+                )
+
         if not FEATURE_WELCOME_ENABLED:
             return
 
@@ -665,23 +774,42 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
             name=user.full_name or "User",
             project=CFG.project_name
         )
-
+        if (not is_test_mode()) and source.startswith("discord"):
+            text = (
+                text
+                + "\n\n<i>Вы получили доступ как участник Discord‑сообщества проекта.</i>"
+            )
         if is_test_mode():
-            text = "🧪 <i>Test mode</i>\n\n" + text
+            text = (
+                "🧪 <i>Test mode</i>\n"
+                f"🧪 <i>Source: {source}</i>\n\n"
+                + text
+            )
 
         try:
             msg = await bot.send_message(
-                chat_id=chat.id,
+                chat_id=cast(int, chat.id),
                 text=text,
                 reply_markup=welcome_keyboard(lang)
             )
 
             async with BOT_MESSAGES_LOCK:
                 BOT_MESSAGES[msg.message_id] = (time.time(), "welcome")
-                BOT_MESSAGES_CHAT_ID[msg.message_id] = chat.id
+                BOT_MESSAGES_CHAT_ID[cast(int, msg.message_id)] = cast(int, chat.id)
 
         except Exception as e:
             logging.warning(f"WELCOME APPROVED FAILED | user={user.id} | error={e}")
+
+# --- 1.4.3: Helper for join source from member event ---
+def detect_join_source_from_member_event(event: ChatMemberUpdated) -> str:
+    if (
+        event.old_chat_member.status in {"left", "kicked"}
+        and event.new_chat_member.status == "member"
+    ):
+        if getattr(event.chat, "join_by_request", False):
+            return "discord_request"
+        return "paid"
+    return "telegram"
 
 
 
@@ -722,7 +850,7 @@ async def show_rules(callback: CallbackQuery):
 
     async with BOT_MESSAGES_LOCK:
         BOT_MESSAGES[msg.message_id] = (time.time(), "rules")
-        BOT_MESSAGES_CHAT_ID[msg.message_id] = callback.message.chat.id
+        BOT_MESSAGES_CHAT_ID[cast(int, msg.message_id)] = cast(int, callback.message.chat.id)
 
 
 @dp.callback_query(F.data.startswith("admin:"))
@@ -890,6 +1018,7 @@ async def mute_toggle(message: Message):
         await admin_reply(message, "ℹ️ Использование: /mute on|off")
 
 
+
 @dp.message(F.text.startswith("/autodelete "))
 async def autodelete_toggle(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
@@ -914,6 +1043,71 @@ async def autodelete_toggle(message: Message):
         await admin_reply(message, t(lang, "admin_autodelete_off"))
     else:
         await admin_reply(message, "ℹ️ Использование: /autodelete on|off")
+
+# ===== /whois admin command =====
+@dp.message(F.text.startswith("/whois "))
+async def whois_cmd(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    text = message.text or ""
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await admin_reply(message, "ℹ️ Usage: /whois <user_id>")
+        return
+    user_id_arg = parts[1].strip()
+    try:
+        user_id = int(user_id_arg)
+    except ValueError:
+        await admin_reply(message, "ℹ️ Usage: /whois <user_id>")
+        return
+    user_info = USER_REGISTRY.get(user_id)
+    if not user_info:
+        await admin_reply(message, "ℹ️ User not found in registry")
+        return
+    source = user_info.get("source", "—")
+    labels_set = user_info.get("labels", set())
+    if isinstance(labels_set, set):
+        labels = ", ".join(sorted(labels_set)) if labels_set else "—"
+    else:
+        labels = str(labels_set) if labels_set else "—"
+    first_seen = user_info["first_seen"]
+    chat_id = user_info["chat_id"]
+    reply_text = (
+        f"<b>User info</b>\n"
+        f"• user_id: <code>{user_id}</code>\n"
+        f"• source: <code>{source}</code>\n"
+        f"• labels: <code>{labels}</code>\n"
+        f"• first_seen: <code>{int(first_seen)}</code>\n"
+        f"• chat_id: <code>{chat_id}</code>"
+    )
+    await admin_reply(message, reply_text)
+
+# ===== /export_registry admin command =====
+@dp.message(F.text == "/export_registry")
+async def export_registry_cmd(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+
+    if not USER_REGISTRY:
+        await admin_reply(message, "ℹ️ Registry is empty")
+        return
+
+    lines = []
+    for uid, info in USER_REGISTRY.items():
+        source = info.get("source", "—")
+        labels = info.get("labels", set())
+        if isinstance(labels, set):
+            labels_str = ",".join(sorted(labels)) if labels else "—"
+        else:
+            labels_str = str(labels)
+        first_seen = int(info["first_seen"])
+        chat_id = info["chat_id"]
+        lines.append(
+            f"{uid} | {source} | {labels_str} | {first_seen} | {chat_id}"
+        )
+
+    text = "<b>User Registry Export</b>\n\n" + "\n".join(lines)
+    await admin_reply(message, text)
 @dp.message(F.text.startswith("/"))
 async def unknown_command(message: Message):
     if not message.from_user:
@@ -943,8 +1137,8 @@ async def cleanup_bot_messages():
                 continue
             try:
                 await bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=msg_id
+                    chat_id=cast(int, chat_id),
+                    message_id=cast(int, msg_id)
                 )
             except Exception as e:
                 logging.warning(f"CLEANUP | delete failed | msg_id={msg_id} | error={e}")
@@ -982,6 +1176,8 @@ def _handle_shutdown():
     shutdown_event.set()
 
 async def main():
+    if not acquire_startup_lock():
+        return
     logging.info(
         f"STARTUP | version={VERSION} "
         f"mute={CFG.mute_new_users} "
@@ -1007,6 +1203,7 @@ async def main():
     tasks.append(asyncio.create_task(cleanup_bot_messages()))
     tasks.append(asyncio.create_task(cleanup_caches()))
 
+    await asyncio.sleep(1)  # anti-flood startup delay
     polling = asyncio.create_task(dp.start_polling(bot))
     tasks.append(polling)
 
@@ -1020,6 +1217,12 @@ async def main():
             await task
         except asyncio.CancelledError:
             pass
+
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except Exception:
+        pass
 
     logging.info("SHUTDOWN | all tasks stopped cleanly")
 
