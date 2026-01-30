@@ -9,11 +9,27 @@ __pycache__/
 dist/
 build/
 
-# ================== Virtual env ==================
+# ================== Virtual environments ==================
 venv/
-.env/
+.venv/
+.env
 .env.*
 !.env.example
+
+# ================== Runtime data ==================
+user_registry.json
+*.cache.json
+*.state.json
+
+# ================== Logs ==================
+*.log
+logs/
+
+# ================== Caches ==================
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # ================== IDE ==================
 .vscode/
@@ -22,26 +38,19 @@ venv/
 *.swo
 .DS_Store
 
-# ================== Logs ==================
-*.log
-logs/
-
-# ================== Runtime / Cache ==================
-.cache/
-.pytest_cache/
-.mypy_cache/
-
-# ================== Railway ==================
-.railway/
-
 # ================== OS ==================
 Thumbs.db
 
-# ================== Secrets ==================
+# ================== Secrets / Keys ==================
 *.pem
 *.key
 *.crt
 
-# ================== Docker (если появится) ==================
+# ================== Railway ==================
+.railway/
+
+# ================== Docker ==================
 docker-compose.override.yml
-.env
+
+# ================== Local tooling ==================
+runtime.txt.local
