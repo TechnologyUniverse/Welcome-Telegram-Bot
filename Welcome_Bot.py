@@ -27,17 +27,43 @@ logging.basicConfig(
 
 
 # ================== VERSION ==================
-VERSION = "1.4.9.02"
-# v1.4.9.02 — Fix Pylance ConvertibleToInt (TypedDict registry)
+# v1.5.9.200 — PID-aware startup lock (auto-recover, no manual rm)
+VERSION = "1.5.9.200"
+# v1.5.2 — Source → Badge (UX)
+# Branch 1.5.x started
+# Goal: user context, source attribution, badges, persistence preparation
 
 # ================== 1.4.5 UX & FLOOD SAFETY ==================
 # Simple single-instance lock to avoid parallel polling
 LOCK_FILE = "/tmp/welcome_bot.lock"
 # =============================================================
+import errno
+
 def acquire_startup_lock() -> bool:
     if os.path.exists(LOCK_FILE):
-        logging.error("STARTUP | lock exists, another instance is running")
-        return False
+        try:
+            with open(LOCK_FILE, "r") as f:
+                pid = int(f.read().strip())
+
+            # Проверяем, жив ли процесс
+            os.kill(pid, 0)
+            logging.error(
+                f"STARTUP | lock exists, process alive | pid={pid}"
+            )
+            return False
+
+        except ValueError:
+            logging.warning("STARTUP | invalid lock file, recreating")
+        except ProcessLookupError:
+            logging.warning("STARTUP | stale lock detected, recreating")
+        except PermissionError:
+            logging.error("STARTUP | no permission to check PID")
+            return False
+        except OSError as e:
+            if e.errno != errno.ESRCH:
+                logging.error(f"STARTUP | lock check failed | error={e}")
+                return False
+
     try:
         with open(LOCK_FILE, "w") as f:
             f.write(str(os.getpid()))
@@ -193,8 +219,13 @@ def load_config() -> Config:
     )
 # ================================================
 
-
 CFG = load_config()
+
+bot = Bot(
+    token=CFG.bot_token,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher()
 
 # ===== Unified UX timing for admin/test UX messages =====
 UX_TTL_SECONDS = 60
@@ -213,7 +244,8 @@ RULES_TTL_SECONDS = 300  # 5 минут антиспам для правил
 
 from typing import TypedDict, Set
 
-# ================== USER REGISTRY (1.4.1) ==================
+# ================== USER REGISTRY (1.5.0 foundation) ==================
+REGISTRY_READ_ONLY = True  # v1.5.4 — protect existing records from modification
 # user_id -> {"source": str, "labels": set[str], "first_seen": float, "chat_id": int}
 class UserRegistryItem(TypedDict):
     source: str
@@ -221,7 +253,247 @@ class UserRegistryItem(TypedDict):
     first_seen: float
     chat_id: int
 
+class JoinSource:
+    TELEGRAM = "telegram"
+    INVITE_LINK = "invite_link"
+    DISCORD = "discord"
+    PAID = "paid"
+    REQUEST = "request"
+
+# UX Badges for join source (v1.5.2)
+SOURCE_BADGES = {
+    JoinSource.DISCORD: "🟣 Discord member",
+    JoinSource.PAID: "💳 Paid access",
+    JoinSource.INVITE_LINK: "🔗 Invite link",
+    JoinSource.REQUEST: "📝 Join request",
+}
+
+# ================== USER REGISTRY STORAGE (1.5.3) ==================
 USER_REGISTRY: dict[int, UserRegistryItem] = {}
+USER_REGISTRY_FILE = "user_registry.json"
+
+# --- Registry schema versioning ---
+REGISTRY_SCHEMA_VERSION = 1
+REGISTRY_META_KEY = "_schema_version"
+
+# --- v1.5.5: audit log for registry mutations ---
+def log_registry_mutation(admin_id: int, user_id: int, action: str, details: str):
+    logging.info(
+        f"REGISTRY_MUTATION | admin={admin_id} | user={user_id} | action={action} | {details}"
+    )
+
+def save_user_registry():
+    try:
+        import json
+        data = {
+            REGISTRY_META_KEY: REGISTRY_SCHEMA_VERSION,
+            "users": {
+                str(uid): {
+                    "source": info["source"],
+                    "labels": list(info["labels"]),
+                    "first_seen": info["first_seen"],
+                    "chat_id": info["chat_id"],
+                }
+                for uid, info in USER_REGISTRY.items()
+            }
+        }
+        with open(USER_REGISTRY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"REGISTRY | save failed | error={e}")
+
+def load_user_registry():
+    if not os.path.exists(USER_REGISTRY_FILE):
+        return
+    try:
+        import json
+        with open(USER_REGISTRY_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        schema_version = raw.get(REGISTRY_META_KEY, 0)
+        users = raw.get("users", {})
+
+        for uid, data in users.items():
+            USER_REGISTRY[int(uid)] = {
+                "source": data.get("source", JoinSource.TELEGRAM),
+                "labels": set(data.get("labels", [])),
+                "first_seen": float(data.get("first_seen", time.time())),
+                "chat_id": int(data.get("chat_id", 0)),
+            }
+
+        logging.info(
+            f"REGISTRY | loaded {len(USER_REGISTRY)} users | schema=v{schema_version}"
+        )
+    except Exception as e:
+        logging.error(f"REGISTRY | load failed | error={e}")
+
+# --- Registry schema validator ---
+def validate_registry_schema() -> tuple[bool, str]:
+    if not os.path.exists(USER_REGISTRY_FILE):
+        return True, "Registry file not found"
+
+    try:
+        import json
+        with open(USER_REGISTRY_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        if REGISTRY_META_KEY not in raw:
+            return False, "Missing schema version"
+
+        if raw[REGISTRY_META_KEY] != REGISTRY_SCHEMA_VERSION:
+            return False, f"Schema mismatch: {raw[REGISTRY_META_KEY]} != {REGISTRY_SCHEMA_VERSION}"
+
+        if "users" not in raw or not isinstance(raw["users"], dict):
+            return False, "Invalid users section"
+
+        return True, "Schema valid"
+    except Exception as e:
+        return False, f"Validation error: {e}"
+
+# --- Dry-run migration stub ---
+def dry_run_migration(target_version: int) -> str:
+    affected = len(USER_REGISTRY)
+    return (
+        f"🧪 Dry-run migration\n\n"
+        f"From: v{REGISTRY_SCHEMA_VERSION}\n"
+        f"To: v{target_version}\n"
+        f"Users affected: {affected}\n\n"
+        f"❗ No data was modified"
+    )
+
+# --- Apply migration stub (blocked) ---
+def apply_migration(target_version: int) -> str:
+    return (
+        f"⛔ Migration blocked\n\n"
+        f"Target version: v{target_version}\n"
+        f"Reason: apply_migration is disabled in v1.5.9\n"
+        f"Use --dry-run only"
+    )
+
+# --- v1.5.9: controlled migration apply (preview, blocked by flag) ---
+MIGRATION_APPLY_ENABLED = False  # hard safety switch
+
+def apply_migration_controlled(target_version: int, admin_id: int) -> str:
+    if REGISTRY_READ_ONLY:
+        return (
+            "⛔ Migration blocked\n\n"
+            "Reason: REGISTRY_READ_ONLY = True"
+        )
+    if not MIGRATION_APPLY_ENABLED:
+        return (
+            "⛔ Migration apply is disabled\n\n"
+            f"Target version: v{target_version}\n"
+            "Reason: MIGRATION_APPLY_ENABLED = False"
+        )
+    log_registry_mutation(
+        admin_id,
+        0,
+        "apply_migration",
+        f"to=v{target_version}"
+    )
+    return (
+        "⚠️ Migration apply stub\n\n"
+        f"Target version: v{target_version}\n"
+        "No changes were made"
+    )
+# ===== Registry admin commands =====
+
+# --- Registry schema check command ---
+@dp.message(F.text == "/registry_schema")
+async def registry_schema_cmd(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+
+    ok, info = validate_registry_schema()
+    status = "✅ OK" if ok else "⚠️ INVALID"
+
+    await admin_reply(
+        message,
+        f"<b>Registry schema</b>\n"
+        f"Version: v{REGISTRY_SCHEMA_VERSION}\n"
+        f"Status: {status}\n"
+        f"Info: {info}"
+    )
+
+# --- v1.5.8: Registry migration plan preview command ---
+@dp.message(F.text == "/registry_plan")
+async def registry_plan_cmd(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+
+    plan = (
+        "🧭 <b>Registry migration plan</b>\n\n"
+        "1️⃣ Backup user_registry.json\n"
+        "2️⃣ Run /registry_schema\n"
+        "3️⃣ Run /registry_migrate <version> --dry-run\n"
+        "4️⃣ Set REGISTRY_READ_ONLY = False\n"
+        "5️⃣ Enable MIGRATION_APPLY_ENABLED\n"
+        "6️⃣ Run /registry_apply <version> (private chat)\n"
+        "7️⃣ Verify integrity\n"
+        "8️⃣ Disable MIGRATION_APPLY_ENABLED\n"
+        "9️⃣ Set REGISTRY_READ_ONLY = True\n\n"
+        "⚠️ No data is modified by this command"
+    )
+
+    await admin_reply(message, plan)
+
+# --- Registry migration dry-run command ---
+@dp.message(F.text.startswith("/registry_migrate "))
+async def registry_migrate_cmd(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+
+    text = message.text or ""
+    parts = text.split()
+    if len(parts) < 2:
+        await admin_reply(message, "ℹ️ Usage: /registry_migrate <version> [--dry-run]")
+        return
+
+    try:
+        target_version = int(parts[1])
+    except ValueError:
+        await admin_reply(message, "❌ Invalid target version")
+        return
+
+    is_dry = "--dry-run" in parts
+
+    if not is_dry:
+        text = apply_migration(target_version)
+        await admin_reply(message, text)
+        return
+
+    text = dry_run_migration(target_version)
+    log_registry_mutation(
+        message.from_user.id,
+        0,
+        "dry_run_migration",
+        f"to=v{target_version}"
+    )
+    await admin_reply(message, text)
+
+# --- v1.5.9: Registry controlled apply command (preview, blocked by flag) ---
+@dp.message(F.text.startswith("/registry_apply "))
+async def registry_apply_cmd(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if message.chat.type != "private":
+        return
+
+    text = message.text or ""
+    parts = text.split()
+    if len(parts) < 2:
+        await admin_reply(message, "ℹ️ Usage: /registry_apply <version>")
+        return
+
+    try:
+        target_version = int(parts[1])
+    except ValueError:
+        await admin_reply(message, "❌ Invalid target version")
+        return
+
+    text = apply_migration_controlled(target_version, message.from_user.id)
+    await admin_reply(message, text)
+# ===========================================================
 # ===========================================================
 
 # bot_message_id -> (timestamp, message_type)
@@ -357,11 +629,6 @@ TEXTS = {
 }
 # ================================================
 
-bot = Bot(
-    token=CFG.bot_token,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher()
 
 
 async def bot_has_permissions(chat_id: int) -> dict[str, bool]:
@@ -533,22 +800,19 @@ def is_paid_like_chat(message: Message) -> bool:
         or getattr(chat, "join_to_send_messages", False)
     )
 
-# Helper: detect join source from message (1.4.3)
+# Helper: detect join source from message (1.5.1)
 def detect_join_source_from_message(message: Message) -> str:
-    source = "telegram"
+    if getattr(message.chat, "join_by_request", False):
+        return JoinSource.REQUEST
 
     invite = getattr(message, "invite_link", None)
     if invite:
         name = (invite.name or "").lower()
         if "discord" in name:
-            source = "discord"
-        else:
-            source = "invite_link"
+            return JoinSource.DISCORD
+        return JoinSource.INVITE_LINK
 
-    if getattr(message.chat, "join_by_request", False):
-        source = "request"
-
-    return source
+    return JoinSource.TELEGRAM
 
 
 @dp.message(F.new_chat_members)
@@ -590,7 +854,7 @@ async def welcome_new_user(message: Message):
     logging.info(
         f"JOIN_SOURCE | user={getattr(message.from_user, 'id', '?')} | source={source}"
     )
-    if source.startswith("discord"):
+    if source == JoinSource.DISCORD:
         logging.info(
             f"DISCORD_USER | user={getattr(message.from_user, 'id', '?')} | chat={message.chat.id}"
         )
@@ -616,9 +880,9 @@ async def welcome_new_user(message: Message):
         # --- 1.4.2: user registry with chat_id
         if user.id not in USER_REGISTRY:
             labels: Set[str] = set()
-            if source.startswith("discord"):
+            if source == JoinSource.DISCORD:
                 labels.add("discord_member")
-            if paid_like:
+            if source == JoinSource.PAID:
                 labels.add("paid_member")
 
             USER_REGISTRY[user.id] = {
@@ -627,9 +891,12 @@ async def welcome_new_user(message: Message):
                 "first_seen": now,
                 "chat_id": cast(int, message.chat.id)
             }
+            save_user_registry()
             logging.info(
                 f"USER_JOIN | user={user.id} | source={source}"
             )
+        else:
+            logging.info(f"REGISTRY | read-only skip | user={user.id}")
 
         if (
             FEATURE_MUTE_ENABLED
@@ -669,7 +936,11 @@ async def welcome_new_user(message: Message):
                 name=safe_name,
                 project=CFG.project_name
             )
-            if (not is_test_mode()) and source.startswith("discord"):
+            # v1.5.2: Add badge after welcome text
+            badge = SOURCE_BADGES.get(source)
+            if badge and not is_test_mode():
+                text = text + f"\n\n<b>{badge}</b>"
+            if (not is_test_mode()) and source == JoinSource.DISCORD:
                 text = (
                     text
                     + "\n\n<i>Вы получили доступ как участник Discord‑сообщества проекта.</i>"
@@ -747,9 +1018,9 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
         # --- 1.4.2: user registry with chat_id
         if user.id not in USER_REGISTRY:
             labels: Set[str] = set()
-            if source.startswith("discord"):
+            if source == JoinSource.DISCORD:
                 labels.add("discord_member")
-            if source == "paid":
+            if source == JoinSource.PAID:
                 labels.add("paid_member")
 
             USER_REGISTRY[user.id] = {
@@ -758,13 +1029,16 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
                 "first_seen": now,
                 "chat_id": cast(int, chat.id)
             }
+            save_user_registry()
             logging.info(
                 f"USER_JOIN | user={user.id} | source={source}"
             )
-            if source.startswith("discord"):
+            if source == JoinSource.DISCORD:
                 logging.info(
                     f"DISCORD_USER | user={user.id} | chat={chat.id}"
                 )
+        else:
+            logging.info(f"REGISTRY | read-only skip | user={user.id}")
 
         if not FEATURE_WELCOME_ENABLED:
             return
@@ -774,7 +1048,11 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
             name=user.full_name or "User",
             project=CFG.project_name
         )
-        if (not is_test_mode()) and source.startswith("discord"):
+        # v1.5.2: Add badge after welcome text
+        badge = SOURCE_BADGES.get(source)
+        if badge and not is_test_mode():
+            text = text + f"\n\n<b>{badge}</b>"
+        if (not is_test_mode()) and source == JoinSource.DISCORD:
             text = (
                 text
                 + "\n\n<i>Вы получили доступ как участник Discord‑сообщества проекта.</i>"
@@ -800,16 +1078,17 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
         except Exception as e:
             logging.warning(f"WELCOME APPROVED FAILED | user={user.id} | error={e}")
 
-# --- 1.4.3: Helper for join source from member event ---
+# --- 1.5.1: Helper for join source from member event ---
 def detect_join_source_from_member_event(event: ChatMemberUpdated) -> str:
     if (
         event.old_chat_member.status in {"left", "kicked"}
         and event.new_chat_member.status == "member"
     ):
         if getattr(event.chat, "join_by_request", False):
-            return "discord_request"
-        return "paid"
-    return "telegram"
+            return JoinSource.PAID
+        return JoinSource.TELEGRAM
+
+    return JoinSource.TELEGRAM
 
 
 
@@ -1044,6 +1323,91 @@ async def autodelete_toggle(message: Message):
     else:
         await admin_reply(message, "ℹ️ Использование: /autodelete on|off")
 
+@dp.message(F.text.startswith("/registry_set "))
+async def registry_set_cmd(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+
+    if REGISTRY_READ_ONLY:
+        await admin_reply(
+            message,
+            "⛔ Registry is read-only. Mutations are disabled."
+        )
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 4:
+        await admin_reply(
+            message,
+            "ℹ️ Usage:\n"
+            "/registry_set <user_id> source <value>\n"
+            "/registry_set <user_id> add_label <label>\n"
+            "/registry_set <user_id> remove_label <label>"
+        )
+        return
+
+    try:
+        target_user = int(parts[1])
+    except ValueError:
+        await admin_reply(message, "❌ Invalid user_id")
+        return
+
+    action = parts[2]
+    value = parts[3]
+
+    if target_user not in USER_REGISTRY:
+        await admin_reply(message, "❌ User not found in registry")
+        return
+
+    record = USER_REGISTRY[target_user]
+
+    if action == "source":
+        old = record["source"]
+        record["source"] = value
+        save_user_registry()
+        log_registry_mutation(
+            message.from_user.id,
+            target_user,
+            "set_source",
+            f"{old} → {value}"
+        )
+        await admin_reply(message, f"✅ source updated: {old} → {value}")
+        return
+
+    if action == "add_label":
+        labels = record["labels"]
+        if value in labels:
+            await admin_reply(message, "ℹ️ Label already exists")
+            return
+        labels.add(value)
+        save_user_registry()
+        log_registry_mutation(
+            message.from_user.id,
+            target_user,
+            "add_label",
+            value
+        )
+        await admin_reply(message, f"✅ label added: {value}")
+        return
+
+    if action == "remove_label":
+        labels = record["labels"]
+        if value not in labels:
+            await admin_reply(message, "ℹ️ Label not present")
+            return
+        labels.remove(value)
+        save_user_registry()
+        log_registry_mutation(
+            message.from_user.id,
+            target_user,
+            "remove_label",
+            value
+        )
+        await admin_reply(message, f"✅ label removed: {value}")
+        return
+
+    await admin_reply(message, "❌ Unknown action")
+
 # ===== /whois admin command =====
 @dp.message(F.text.startswith("/whois "))
 async def whois_cmd(message: Message):
@@ -1083,6 +1447,7 @@ async def whois_cmd(message: Message):
     await admin_reply(message, reply_text)
 
 # ===== /export_registry admin command =====
+# ===== /export_registry admin command =====
 @dp.message(F.text == "/export_registry")
 async def export_registry_cmd(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
@@ -1108,6 +1473,27 @@ async def export_registry_cmd(message: Message):
 
     text = "<b>User Registry Export</b>\n\n" + "\n".join(lines)
     await admin_reply(message, text)
+
+# ===== Admin helper: get photo file_id (test-mode only) =====
+@dp.message(F.photo)
+async def get_photo_file_id(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if not is_test_mode():
+        return
+
+    photos = message.photo
+    if not photos:
+        return
+
+    photo = photos[-1]  # highest resolution
+    file_id = photo.file_id
+
+    await message.answer(
+        "🆔 <b>Telegram file_id</b>\n\n"
+        f"<code>{file_id}</code>\n\n"
+        "ℹ️ Используйте этот file_id в WELCOME_IMAGE_URL"
+    )
 @dp.message(F.text.startswith("/"))
 async def unknown_command(message: Message):
     if not message.from_user:
@@ -1178,6 +1564,8 @@ def _handle_shutdown():
 async def main():
     if not acquire_startup_lock():
         return
+    load_user_registry()
+    logging.info(f"REGISTRY | read_only={REGISTRY_READ_ONLY}")
     logging.info(
         f"STARTUP | version={VERSION} "
         f"mute={CFG.mute_new_users} "
@@ -1218,6 +1606,7 @@ async def main():
         except asyncio.CancelledError:
             pass
 
+    save_user_registry()
     try:
         if os.path.exists(LOCK_FILE):
             os.remove(LOCK_FILE)

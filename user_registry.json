@@ -1,0 +1,11 @@
+{
+  "_schema_version": 1,
+  "users": {
+    "6206242114": {
+      "source": "telegram",
+      "labels": [],
+      "first_seen": 1769784941.2308328,
+      "chat_id": -1003657920940
+    }
+  }
+}
