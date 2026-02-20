@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 import signal
 from typing import cast
+import html
 
 load_dotenv()
 
@@ -27,8 +28,8 @@ logging.basicConfig(
 
 
 # ================== VERSION ==================
-# v1.5.9.200 — PID-aware startup lock (auto-recover, no manual rm)
-VERSION = "1.5.9.200"
+# v1.5.9.810 — Discord Join Fix (invite_link detection + approved join sync)
+VERSION = "1.5.9.810"
 # v1.5.2 — Source → Badge (UX)
 # Branch 1.5.x started
 # Goal: user context, source attribution, badges, persistence preparation
@@ -311,6 +312,18 @@ def load_user_registry():
             raw = json.load(f)
 
         schema_version = raw.get(REGISTRY_META_KEY, 0)
+        if schema_version != REGISTRY_SCHEMA_VERSION:
+            logging.warning(
+                f"REGISTRY | schema mismatch detected | file=v{schema_version} code=v{REGISTRY_SCHEMA_VERSION}"
+            )
+            # safe auto-upgrade: only update meta version without altering user data
+            raw[REGISTRY_META_KEY] = REGISTRY_SCHEMA_VERSION
+            try:
+                with open(USER_REGISTRY_FILE, "w", encoding="utf-8") as wf:
+                    json.dump(raw, wf, ensure_ascii=False, indent=2)
+                logging.info("REGISTRY | schema version auto-upgraded safely")
+            except Exception as e:
+                logging.error(f"REGISTRY | auto-upgrade failed | error={e}")
         users = raw.get("users", {})
 
         for uid, data in users.items():
@@ -403,6 +416,9 @@ def apply_migration_controlled(target_version: int, admin_id: int) -> str:
 async def registry_schema_cmd(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
+    if message.chat.type != "private":
+        await admin_reply(message, "🔒 Admin command available only in private chat")
+        return
 
     ok, info = validate_registry_schema()
     status = "✅ OK" if ok else "⚠️ INVALID"
@@ -419,6 +435,9 @@ async def registry_schema_cmd(message: Message):
 @dp.message(F.text == "/registry_plan")
 async def registry_plan_cmd(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if message.chat.type != "private":
+        await admin_reply(message, "🔒 Admin command available only in private chat")
         return
 
     plan = (
@@ -441,6 +460,9 @@ async def registry_plan_cmd(message: Message):
 @dp.message(F.text.startswith("/registry_migrate "))
 async def registry_migrate_cmd(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if message.chat.type != "private":
+        await admin_reply(message, "🔒 Admin command available only in private chat")
         return
 
     text = message.text or ""
@@ -510,7 +532,7 @@ DEFAULT_LANG = "ru"
 TEXTS = {
     "ru": {
         "welcome": (
-            "👋 <b>Добро пожаловать в закрытое Telegram-сообщество проекта {project}</b>\n\n"
+            "👋 <b>{name}, добро пожаловать в закрытое Telegram‑сообщество проекта {project}</b>\n\n"
             "Сообщество предназначено для общения по вопросам\n"
             "настройки, использования, тестирования и устранения проблем\n"
             "в программном обеспечении и операционных системах Apple и Microsoft.\n\n"
@@ -576,7 +598,7 @@ TEXTS = {
     },
     "en": {
         "welcome": (
-            "👋 <b>Welcome to the private Telegram community of the Technology Universe project</b>\n\n"
+            "👋 <b>{name}, welcome to the private Telegram community of the {project} project</b>\n\n"
             "This community is intended for discussions about\n"
             "setup, usage, testing, and troubleshooting\n"
             "software and operating systems by Apple and Microsoft.\n\n"
@@ -664,11 +686,20 @@ def is_test_mode() -> bool:
     return CFG.bot_mode == "test"
 
 
-# Unified TTL helper for UX messages (v1.3.16)
 def get_message_ttl(msg_type: str) -> int:
+    """
+    v1.5.9.x — Unified auto-delete policy
+
+    • In TEST mode → short TTL (60s)
+    • In PROD mode → ALL bot messages use CFG.auto_delete_seconds
+    """
+
+    # Test mode → fixed short TTL
     if is_test_mode():
         return 60
-    return 300
+
+    # Prod mode → everything deletes using configured AUTO_DELETE_SECONDS
+    return CFG.auto_delete_seconds
 
 
 # Ограничение доступа к /control
@@ -682,14 +713,27 @@ def is_control_allowed(message: Message) -> bool:
 
 # Admin reply helper
 async def admin_reply(message: Message, text: str):
-    if not is_test_mode():
+    # v1.5.9.210 — Ephemeral admin replies
+
+    try:
+        msg = await message.answer(text)
+    except Exception:
         return
 
-    msg = await message.answer(text)
+    # В группе — автоудаление через 10 секунд
+    if message.chat.type != "private":
+        try:
+            await asyncio.sleep(10)
+            await msg.delete()
+            await message.delete()
+        except Exception:
+            pass
+        return
 
+    # В личке — стандартная TTL-логика
     async with BOT_MESSAGES_LOCK:
         BOT_MESSAGES[msg.message_id] = (time.time(), "admin")
-        BOT_MESSAGES_CHAT_ID[cast(int, msg.message_id)] = cast(int, message.chat.id)
+        BOT_MESSAGES_CHAT_ID[msg.message_id] = message.chat.id
 
 
 def admin_control_keyboard(lang: str) -> InlineKeyboardMarkup:
@@ -704,12 +748,11 @@ def admin_control_keyboard(lang: str) -> InlineKeyboardMarkup:
     ])
 @dp.message(F.text == "/control")
 async def admin_control_panel(message: Message):
-    if not is_control_allowed(message):
-        return
     if not message.from_user:
         return
     if not is_admin(message.from_user.id):
-        await message.answer(t(detect_lang(message.from_user.language_code), "admin_no_access"))
+        return
+    if message.chat.type != "private":
         return
 
     lang = detect_lang(message.from_user.language_code)
@@ -788,12 +831,12 @@ async def show_about(callback: CallbackQuery):
         BOT_MESSAGES_CHAT_ID[cast(int, msg.message_id)] = cast(int, callback.message.chat.id)
 
 
-def is_paid_like_chat(message: Message) -> bool:
+def is_paid_like_chat(chat) -> bool:
     """
     UX-эвристика для платных / закрытых чатов.
+    Принимает chat-объект (Message.chat или ChatMemberUpdated.chat).
     Не является платёжной логикой.
     """
-    chat = message.chat
     return bool(
         getattr(chat, "has_protected_content", False)
         or getattr(chat, "join_by_request", False)
@@ -826,7 +869,7 @@ async def welcome_new_user(message: Message):
 
     perms = await bot_has_permissions(cast(int, message.chat.id))
 
-    paid_like = is_paid_like_chat(message)
+    paid_like = is_paid_like_chat(message.chat)
 
     if paid_like:
         logging.info(
@@ -851,17 +894,13 @@ async def welcome_new_user(message: Message):
 
     # --- 1.4.1: detect join source
     source = detect_join_source_from_message(message)
-    logging.info(
-        f"JOIN_SOURCE | user={getattr(message.from_user, 'id', '?')} | source={source}"
-    )
-    if source == JoinSource.DISCORD:
-        logging.info(
-            f"DISCORD_USER | user={getattr(message.from_user, 'id', '?')} | chat={message.chat.id}"
-        )
 
     for user in message.new_chat_members:
         if user.is_bot:
             continue
+        logging.info(
+            f"JOIN_SOURCE | user={user.id} | source={source}"
+        )
 
         now = time.time()
         last_time = WELCOME_CACHE.get(user.id)
@@ -896,7 +935,20 @@ async def welcome_new_user(message: Message):
                 f"USER_JOIN | user={user.id} | source={source}"
             )
         else:
-            logging.info(f"REGISTRY | read-only skip | user={user.id}")
+            record = USER_REGISTRY[user.id]
+            if source != record.get("source"):
+                logging.info(
+                    f"REGISTRY | source updated | user={user.id} | {record.get('source')} → {source}"
+                )
+                if not REGISTRY_READ_ONLY:
+                    record["source"] = source
+                    if source == JoinSource.DISCORD:
+                        record["labels"].add("discord_member")
+                    if source == JoinSource.PAID:
+                        record["labels"].add("paid_member")
+                    save_user_registry()
+            else:
+                logging.info(f"REGISTRY | read-only skip | user={user.id}")
 
         if (
             FEATURE_MUTE_ENABLED
@@ -927,11 +979,12 @@ async def welcome_new_user(message: Message):
 
         if FEATURE_WELCOME_ENABLED:
             logging.info(
-                f"WELCOME | user={user.id}"
+                f"WELCOME_SENT | user={user.id} | source={source} | chat={message.chat.id}"
             )
 
             lang = detect_lang(user.language_code)
-            safe_name = user.full_name or "User"
+            raw_name = user.full_name or "User"
+            safe_name = html.escape(raw_name)
             text = t(lang, "welcome").format(
                 name=safe_name,
                 project=CFG.project_name
@@ -970,17 +1023,9 @@ async def welcome_new_user(message: Message):
                 )
 
             async with BOT_MESSAGES_LOCK:
-                BOT_MESSAGES[msg.message_id] = (time.time(), "welcome")
-                BOT_MESSAGES_CHAT_ID[cast(int, msg.message_id)] = cast(int, message.chat.id)
-
-            if (
-                FEATURE_AUTODELETE_ENABLED
-                and CFG.auto_delete_seconds > 0
-                and not is_test_mode()
-                and not paid_like
-            ):
-                await asyncio.sleep(float(CFG.auto_delete_seconds))
-                await msg.delete()
+                if FEATURE_AUTODELETE_ENABLED and not paid_like:
+                    BOT_MESSAGES[msg.message_id] = (time.time(), "welcome")
+                    BOT_MESSAGES_CHAT_ID[msg.message_id] = cast(int, message.chat.id)
 
 
 # --- v1.3.9.18: Welcome for invite link & paid join approval ---
@@ -1040,12 +1085,46 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
         else:
             logging.info(f"REGISTRY | read-only skip | user={user.id}")
 
+        # --- sync mute logic for approved joins ---
+        perms = await bot_has_permissions(cast(int, chat.id))
+        # paid-like detection must use chat context, not ChatMember object
+        paid_like = is_paid_like_chat(chat)
+
+        if (
+            FEATURE_MUTE_ENABLED
+            and CFG.mute_new_users
+            and perms["restrict"]
+            and not is_test_mode()
+            and not paid_like
+        ):
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=cast(int, chat.id),
+                    user_id=cast(int, user.id),
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False
+                    ),
+                    until_date=int(time.time()) + int(CFG.mute_seconds)
+                )
+                logging.info(
+                    f"MUTED | user={user.id} | seconds={CFG.mute_seconds}"
+                )
+            except Exception as e:
+                logging.warning(
+                    f"MUTE FAILED | user={user.id} | error={e}"
+                )
+
         if not FEATURE_WELCOME_ENABLED:
             return
 
         lang = detect_lang(user.language_code)
+        raw_name = user.full_name or "User"
+        safe_name = html.escape(raw_name)
         text = t(lang, "welcome").format(
-            name=user.full_name or "User",
+            name=safe_name,
             project=CFG.project_name
         )
         # v1.5.2: Add badge after welcome text
@@ -1071,21 +1150,38 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
                 reply_markup=welcome_keyboard(lang)
             )
 
+            logging.info(
+                f"WELCOME_SENT | user={user.id} | source={source} | chat={chat.id}"
+            )
+
             async with BOT_MESSAGES_LOCK:
-                BOT_MESSAGES[msg.message_id] = (time.time(), "welcome")
-                BOT_MESSAGES_CHAT_ID[cast(int, msg.message_id)] = cast(int, chat.id)
+                if FEATURE_AUTODELETE_ENABLED:
+                    BOT_MESSAGES[msg.message_id] = (time.time(), "welcome")
+                    BOT_MESSAGES_CHAT_ID[msg.message_id] = cast(int, chat.id)
 
         except Exception as e:
             logging.warning(f"WELCOME APPROVED FAILED | user={user.id} | error={e}")
 
 # --- 1.5.1: Helper for join source from member event ---
 def detect_join_source_from_member_event(event: ChatMemberUpdated) -> str:
+    # Trigger only on real join transition
     if (
         event.old_chat_member.status in {"left", "kicked"}
         and event.new_chat_member.status == "member"
     ):
+        # 1️⃣ Join by request (paid / approval flow)
         if getattr(event.chat, "join_by_request", False):
             return JoinSource.PAID
+
+        # 2️⃣ Invite link detection (like in message handler)
+        invite = getattr(event, "invite_link", None)
+        if invite:
+            name = (invite.name or "").lower()
+            if "discord" in name:
+                return JoinSource.DISCORD
+            return JoinSource.INVITE_LINK
+
+        # 3️⃣ Fallback
         return JoinSource.TELEGRAM
 
     return JoinSource.TELEGRAM
@@ -1193,16 +1289,20 @@ async def admin_control_callback(callback: CallbackQuery):
 async def version_cmd(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
+    if message.chat.type != "private":
+        return
+
     await message.answer(
         "ℹ️ <b>Welcome Bot</b>\n"
         f"Version: {VERSION}\n"
-        "Channel: Stable (1.3.x)"
+        "Channel: Stable (1.5.x)"
     )
-
 
 @dp.message(F.text == "/health")
 async def health_check(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if message.chat.type != "private":
         return
 
     uptime = int(time.time() - START_TIME)
@@ -1249,6 +1349,8 @@ async def health_check(message: Message):
 async def welcome_toggle(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
+    if message.chat.type != "private":
+        return
 
     text = message.text or ""
     parts = text.split(maxsplit=1)
@@ -1274,6 +1376,8 @@ async def welcome_toggle(message: Message):
 @dp.message(F.text.startswith("/mute "))
 async def mute_toggle(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if message.chat.type != "private":
         return
 
     text = message.text or ""
@@ -1302,6 +1406,8 @@ async def mute_toggle(message: Message):
 async def autodelete_toggle(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
+    if message.chat.type != "private":
+        return
 
     text = message.text or ""
     parts = text.split(maxsplit=1)
@@ -1326,6 +1432,9 @@ async def autodelete_toggle(message: Message):
 @dp.message(F.text.startswith("/registry_set "))
 async def registry_set_cmd(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if message.chat.type != "private":
+        await admin_reply(message, "🔒 Admin command available only in private chat")
         return
 
     if REGISTRY_READ_ONLY:
@@ -1413,6 +1522,9 @@ async def registry_set_cmd(message: Message):
 async def whois_cmd(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
+    if message.chat.type != "private":
+        await admin_reply(message, "🔒 Admin command available only in private chat")
+        return
     text = message.text or ""
     parts = text.strip().split(maxsplit=1)
     if len(parts) < 2:
@@ -1452,6 +1564,9 @@ async def whois_cmd(message: Message):
 async def export_registry_cmd(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
+    if message.chat.type != "private":
+        await admin_reply(message, "🔒 Admin command available only in private chat")
+        return
 
     if not USER_REGISTRY:
         await admin_reply(message, "ℹ️ Registry is empty")
@@ -1474,6 +1589,48 @@ async def export_registry_cmd(message: Message):
     text = "<b>User Registry Export</b>\n\n" + "\n".join(lines)
     await admin_reply(message, text)
 
+# ===== /registry_backup admin command =====
+@dp.message(F.text == "/registry_backup")
+async def registry_backup_cmd(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if message.chat.type != "private":
+        await admin_reply(message, "🔒 Admin command available only in private chat")
+        return
+
+    if not os.path.exists(USER_REGISTRY_FILE):
+        await admin_reply(message, "ℹ️ Registry file not found")
+        return
+
+    backup_name = f"user_registry_backup_{int(time.time())}.json"
+    try:
+        import shutil
+        shutil.copy(USER_REGISTRY_FILE, backup_name)
+        await admin_reply(message, f"✅ Backup created:\n<code>{backup_name}</code>")
+    except Exception as e:
+        await admin_reply(message, f"❌ Backup failed: {e}")
+
+# ===== /registry_stats admin command =====
+@dp.message(F.text == "/registry_stats")
+async def registry_stats_cmd(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if message.chat.type != "private":
+        await admin_reply(message, "🔒 Admin command available only in private chat")
+        return
+
+    total = len(USER_REGISTRY)
+    sources = {}
+    for info in USER_REGISTRY.values():
+        src = info.get("source", "unknown")
+        sources[src] = sources.get(src, 0) + 1
+
+    lines = [f"👥 Total users: {total}\n"]
+    for src, count in sources.items():
+        lines.append(f"• {src}: {count}")
+
+    await admin_reply(message, "<b>Registry stats</b>\n\n" + "\n".join(lines))
+
 # ===== Admin helper: get photo file_id (test-mode only) =====
 @dp.message(F.photo)
 async def get_photo_file_id(message: Message):
@@ -1494,6 +1651,73 @@ async def get_photo_file_id(message: Message):
         f"<code>{file_id}</code>\n\n"
         "ℹ️ Используйте этот file_id в WELCOME_IMAGE_URL"
     )
+
+# ===== v1.5.9.500 — Keyword trigger: "Хранилище" =====
+
+# --- Storage trigger anti-spam cache (v1.5.9.510) ---
+STORAGE_TRIGGER_CACHE: dict[int, float] = {}  # chat_id -> last trigger timestamp
+
+# TTL зависит от режима (test/prod)
+def get_storage_trigger_ttl() -> int:
+    return 60 if is_test_mode() else 300  # 1 минута в test, 5 минут в prod
+@dp.message(F.text)
+async def storage_keyword_trigger(message: Message):
+    if not message.text:
+        return
+    chat_id = cast(int, message.chat.id)
+    now = time.time()
+
+    import re
+
+    text_lower = message.text.lower()
+
+    # React only if the word "хранилище" (any ending) exists
+    if not re.search(r"\bхранилищ\w*\b", text_lower):
+        return
+
+    ttl = get_storage_trigger_ttl()
+    last = STORAGE_TRIGGER_CACHE.get(chat_id)
+    if last and (now - last) < ttl:
+        return
+
+    STORAGE_TRIGGER_CACHE[chat_id] = now
+    logging.info(f"STORAGE_TRIGGER | chat={chat_id} | ttl={ttl}")
+
+    # Ignore commands
+    if message.text.startswith("/"):
+        return
+
+    # Ignore if chat not allowed
+    if not is_allowed_chat(cast(int, message.chat.id)):
+        return
+
+    lang = DEFAULT_LANG
+    if message.from_user:
+        lang = detect_lang(message.from_user.language_code)
+
+    try:
+        msg = await message.answer(
+            "📦 <b>Хранилище проекта</b>\n\n"
+            "Доступ к материалам доступен по кнопке ниже:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=t(lang, "btn_storage"),
+                            url=CFG.storage_url
+                        )
+                    ]
+                ]
+            )
+        )
+
+        # --- unified auto-delete via BOT_MESSAGES (TTL split aware) ---
+        async with BOT_MESSAGES_LOCK:
+            BOT_MESSAGES[msg.message_id] = (time.time(), "storage")
+            BOT_MESSAGES_CHAT_ID[msg.message_id] = chat_id
+
+    except Exception as e:
+        logging.warning(f"STORAGE_TRIGGER | failed | error={e}")
 @dp.message(F.text.startswith("/"))
 async def unknown_command(message: Message):
     if not message.from_user:
@@ -1533,7 +1757,8 @@ async def cleanup_bot_messages():
                 BOT_MESSAGES.pop(msg_id, None)
                 BOT_MESSAGES_CHAT_ID.pop(msg_id, None)
 
-        await asyncio.sleep(60)
+        # check more frequently for better TTL precision
+        await asyncio.sleep(5)
 
 async def cleanup_caches():
     while not shutdown_event.is_set():
@@ -1549,6 +1774,15 @@ async def cleanup_caches():
             expired = [uid for uid, ts in RULES_CACHE.items() if (now - ts) > RULES_TTL_SECONDS]
             for uid in expired:
                 RULES_CACHE.pop(uid, None)
+
+            # storage trigger cache (chat-based)
+            ttl = get_storage_trigger_ttl()
+            expired_chats = [
+                cid for cid, ts in STORAGE_TRIGGER_CACHE.items()
+                if (now - ts) > ttl
+            ]
+            for cid in expired_chats:
+                STORAGE_TRIGGER_CACHE.pop(cid, None)
         except Exception as e:
             logging.warning(f"CACHE | cleanup failed | error={e}")
 
@@ -1572,18 +1806,19 @@ async def main():
         f"delay={CFG.welcome_delay_seconds}s "
         f"autodelete={CFG.auto_delete_seconds}s"
     )
-    logging.info(f"BUILD | version={VERSION} channel=stable-1.3.x")
+    logging.info(f"BUILD | version={VERSION} channel=stable-1.5.x")
     if not CFG.admin_ids:
         logging.warning("ENV | ADMIN_IDS is empty")
 
     if not CFG.allowed_chat_ids:
         logging.warning("ENV | ALLOWED_CHAT_IDS is empty (bot allowed in all chats)")
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _handle_shutdown)
-        except NotImplementedError:
-            pass
+    # Signal handling (safe fallback for macOS local run)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, _handle_shutdown)
+        loop.add_signal_handler(signal.SIGINT, _handle_shutdown)
+    except Exception:
+        pass
     logging.info("RUNTIME | async lifecycle guards enabled")
     tasks = []
 
@@ -1595,16 +1830,20 @@ async def main():
     polling = asyncio.create_task(dp.start_polling(bot))
     tasks.append(polling)
 
-    await shutdown_event.wait()
+    try:
+        await shutdown_event.wait()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logging.info("SHUTDOWN | interruption received inside main")
+        shutdown_event.set()
+    finally:
+        for task in tasks:
+            task.cancel()
 
-    for task in tasks:
-        task.cancel()
-
-    for task in tasks:
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     save_user_registry()
     try:
@@ -1617,4 +1856,13 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("SHUTDOWN | KeyboardInterrupt received (Ctrl+C)")
+        shutdown_event.set()
+        try:
+            if os.path.exists(LOCK_FILE):
+                os.remove(LOCK_FILE)
+        except Exception:
+            pass
