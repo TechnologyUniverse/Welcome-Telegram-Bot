@@ -1681,6 +1681,11 @@ async def storage_keyword_trigger(message: Message):
         return
 
     STORAGE_TRIGGER_CACHE[chat_id] = now
+
+    # Register user message for unified TTL deletion
+    async with BOT_MESSAGES_LOCK:
+        BOT_MESSAGES[message.message_id] = (time.time(), "storage_user")
+        BOT_MESSAGES_CHAT_ID[message.message_id] = chat_id
     logging.info(f"STORAGE_TRIGGER | chat={chat_id} | ttl={ttl}")
 
     # Ignore commands
@@ -1737,6 +1742,7 @@ async def cleanup_bot_messages():
 
         async with BOT_MESSAGES_LOCK:
             for msg_id, (ts, msg_type) in BOT_MESSAGES.items():
+                # unified TTL policy for all message types (bot + user-triggered)
                 ttl = get_message_ttl(msg_type)
                 if (now - ts) > ttl:
                     to_delete.append(msg_id)
