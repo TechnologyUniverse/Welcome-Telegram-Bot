@@ -28,8 +28,8 @@ logging.basicConfig(
 
 
 # ================== VERSION ==================
-# v1.5.9.810 — Discord Join Fix (invite_link detection + approved join sync)
-VERSION = "1.5.9.810"
+# v1.5.9.820 — Paid Hard Protection + Production Stabilization
+VERSION = "1.5.9.820"
 # v1.5.2 — Source → Badge (UX)
 # Branch 1.5.x started
 # Goal: user context, source attribution, badges, persistence preparation
@@ -950,7 +950,17 @@ async def welcome_new_user(message: Message):
             else:
                 logging.info(f"REGISTRY | read-only skip | user={user.id}")
 
-        if (
+        # --- HARD PROTECTION: never mute paid members ---
+        registry_record = USER_REGISTRY.get(user.id)
+        is_paid_member = False
+        if registry_record:
+            labels = registry_record.get("labels", set())
+            if isinstance(labels, set) and "paid_member" in labels:
+                is_paid_member = True
+
+        if is_paid_member:
+            logging.info(f"PAID_SKIP_MUTE | user={user.id} | chat={message.chat.id}")
+        elif (
             FEATURE_MUTE_ENABLED
             and CFG.mute_new_users
             and perms["restrict"]
@@ -1090,7 +1100,17 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
         # paid-like detection must use chat context, not ChatMember object
         paid_like = is_paid_like_chat(chat)
 
-        if (
+        # --- HARD PROTECTION: never mute paid members ---
+        registry_record = USER_REGISTRY.get(user.id)
+        is_paid_member = False
+        if registry_record:
+            labels = registry_record.get("labels", set())
+            if isinstance(labels, set) and "paid_member" in labels:
+                is_paid_member = True
+
+        if is_paid_member:
+            logging.info(f"PAID_SKIP_MUTE | user={user.id} | chat={chat.id}")
+        elif (
             FEATURE_MUTE_ENABLED
             and CFG.mute_new_users
             and perms["restrict"]
