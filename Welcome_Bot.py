@@ -21,15 +21,34 @@ import html
 
 load_dotenv()
 
+
 logging.basicConfig(
     level=logging.INFO,
     format='{"time":"%(asctime)s","level":"%(levelname)s","message":"%(message)s"}'
 )
 
+# Structured logging helper
+def log_event(event: str, **fields):
+    """
+    Structured logging helper with correlation context support.
+    If 'chat' and 'user' provided — builds correlation_id.
+    """
+    base = {"event": event}
+
+    chat_id = fields.get("chat")
+    user_id = fields.get("user")
+    if chat_id is not None and user_id is not None:
+        base["cid"] = f"{chat_id}:{user_id}"
+
+    base.update(fields)
+
+    parts = [f"{k}={v}" for k, v in base.items()]
+    logging.info(" | ".join(parts))
+
 
 # ================== VERSION ==================
-# v1.5.9.820 — Paid Hard Protection + Production Stabilization
-VERSION = "1.5.9.820"
+# v1.5.9.1000 — Async registry lock, mute logic hardening, registry mutation protection
+VERSION = "1.5.9.1000"
 # v1.5.2 — Source → Badge (UX)
 # Branch 1.5.x started
 # Goal: user context, source attribution, badges, persistence preparation
@@ -272,7 +291,10 @@ SOURCE_BADGES = {
 # ================== USER REGISTRY STORAGE (1.5.3) ==================
 USER_REGISTRY: dict[int, UserRegistryItem] = {}
 USER_REGISTRY_FILE = "user_registry.json"
-
+import threading
+REGISTRY_FILE_LOCK = threading.Lock()
+# Async registry lock for protecting registry mutations
+REGISTRY_ASYNC_LOCK = asyncio.Lock()
 # --- Registry schema versioning ---
 REGISTRY_SCHEMA_VERSION = 1
 REGISTRY_META_KEY = "_schema_version"
@@ -284,24 +306,41 @@ def log_registry_mutation(admin_id: int, user_id: int, action: str, details: str
     )
 
 def save_user_registry():
-    try:
-        import json
-        data = {
-            REGISTRY_META_KEY: REGISTRY_SCHEMA_VERSION,
-            "users": {
-                str(uid): {
-                    "source": info["source"],
-                    "labels": list(info["labels"]),
-                    "first_seen": info["first_seen"],
-                    "chat_id": info["chat_id"],
+    with REGISTRY_FILE_LOCK:
+        try:
+            import json
+            import tempfile
+            import os
+
+            data = {
+                REGISTRY_META_KEY: REGISTRY_SCHEMA_VERSION,
+                "users": {
+                    str(uid): {
+                        "source": info["source"],
+                        "labels": list(info["labels"]),
+                        "first_seen": info["first_seen"],
+                        "chat_id": info["chat_id"],
+                    }
+                    for uid, info in USER_REGISTRY.items()
                 }
-                for uid, info in USER_REGISTRY.items()
             }
-        }
-        with open(USER_REGISTRY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.error(f"REGISTRY | save failed | error={e}")
+
+            dir_name = os.path.dirname(os.path.abspath(USER_REGISTRY_FILE)) or "."
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=dir_name,
+                delete=False
+            ) as tmp:
+                json.dump(data, tmp, ensure_ascii=False, indent=2)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                temp_name = tmp.name
+
+            os.replace(temp_name, USER_REGISTRY_FILE)
+
+        except Exception as e:
+            logging.error(f"REGISTRY | atomic save failed | error={e}")
 
 def load_user_registry():
     if not os.path.exists(USER_REGISTRY_FILE):
@@ -843,6 +882,97 @@ def is_paid_like_chat(chat) -> bool:
         or getattr(chat, "join_to_send_messages", False)
     )
 
+# --- v1.5.9.840: Centralized paid detection ---
+def is_paid_member(user_id: int, source: str | None = None) -> bool:
+    if source == JoinSource.PAID:
+        return True
+
+    record = USER_REGISTRY.get(user_id)
+    if not record:
+        return False
+
+    labels = record.get("labels", set())
+    return isinstance(labels, set) and "paid_member" in labels
+
+
+# --- v1.5.9.840: Centralized welcome builder ---
+def build_welcome_text(user, source: str, lang: str, invite_url: str | None = None) -> str:
+    raw_name = user.full_name or "User"
+    safe_name = html.escape(raw_name)
+
+    text = t(lang, "welcome").format(
+        name=safe_name,
+        project=CFG.project_name
+    )
+
+    badge = SOURCE_BADGES.get(source)
+    if badge and not is_test_mode():
+        text += f"\n\n<b>{badge}</b>"
+
+    if invite_url and not is_test_mode():
+        safe_invite = html.escape(invite_url)
+        text += f"\n\n🔗 <b>Invite link:</b>\n<code>{safe_invite}</code>"
+
+    if (not is_test_mode()) and source == JoinSource.DISCORD:
+        text += "\n\n<i>Вы получили доступ как участник Discord‑сообщества проекта.</i>"
+
+    if is_test_mode():
+        text = (
+            "🧪 <i>Test mode</i>\n"
+            f"🧪 <i>Source: {source}</i>\n\n"
+            + text
+        )
+
+    return text
+
+
+async def apply_mute_if_needed(
+    chat_id: int,
+    user_id: int,
+    source: str,
+    perms: dict,
+    paid_like: bool
+):
+    if is_paid_member(user_id, source):
+        log_event("PAID_SKIP_MUTE", user=user_id, chat=chat_id)
+        return
+
+    # v1.5.9.901 — Do not mute users joined via regular invite link
+    if source == JoinSource.INVITE_LINK:
+        log_event("INVITE_SKIP_MUTE", user=user_id, chat=chat_id)
+        return
+
+    if (
+        source == JoinSource.TELEGRAM
+        and FEATURE_MUTE_ENABLED
+        and CFG.mute_new_users
+        and perms.get("restrict")
+        and not is_test_mode()
+        and not paid_like
+    ):
+        try:
+            await bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False
+                ),
+                until_date=int(time.time()) + int(CFG.mute_seconds)
+            )
+            log_event(
+                "MUTED",
+                user=user_id,
+                chat=chat_id,
+                seconds=CFG.mute_seconds
+            )
+        except Exception as e:
+            logging.warning(
+                f"MUTE_FAILED | user={user_id} | chat={chat_id} | error={e}"
+            )
+
 # Helper: detect join source from message (1.5.1)
 def detect_join_source_from_message(message: Message) -> str:
     if getattr(message.chat, "join_by_request", False):
@@ -894,6 +1024,10 @@ async def welcome_new_user(message: Message):
 
     # --- 1.4.1: detect join source
     source = detect_join_source_from_message(message)
+    invite_url = None
+    invite_obj = getattr(message, "invite_link", None)
+    if invite_obj and getattr(invite_obj, "invite_link", None):
+        invite_url = invite_obj.invite_link
 
     for user in message.new_chat_members:
         if user.is_bot:
@@ -916,105 +1050,58 @@ async def welcome_new_user(message: Message):
             WELCOME_CACHE.clear()
             logging.warning("CACHE | WELCOME_CACHE cleared (limit exceeded)")
 
-        # --- 1.4.2: user registry with chat_id
-        if user.id not in USER_REGISTRY:
-            labels: Set[str] = set()
-            if source == JoinSource.DISCORD:
-                labels.add("discord_member")
-            if source == JoinSource.PAID:
-                labels.add("paid_member")
+        # --- 1.4.2: user registry with chat_id (protected with async lock)
+        async with REGISTRY_ASYNC_LOCK:
+            if user.id not in USER_REGISTRY:
+                labels: Set[str] = set()
+                if source == JoinSource.DISCORD:
+                    labels.add("discord_member")
+                if source == JoinSource.PAID:
+                    labels.add("paid_member")
 
-            USER_REGISTRY[user.id] = {
-                "source": source,
-                "labels": labels,
-                "first_seen": now,
-                "chat_id": cast(int, message.chat.id)
-            }
-            save_user_registry()
-            logging.info(
-                f"USER_JOIN | user={user.id} | source={source}"
-            )
-        else:
-            record = USER_REGISTRY[user.id]
-            if source != record.get("source"):
+                USER_REGISTRY[user.id] = {
+                    "source": source,
+                    "labels": labels,
+                    "first_seen": now,
+                    "chat_id": cast(int, message.chat.id)
+                }
+                save_user_registry()
                 logging.info(
-                    f"REGISTRY | source updated | user={user.id} | {record.get('source')} → {source}"
+                    f"USER_JOIN | user={user.id} | source={source}"
                 )
-                if not REGISTRY_READ_ONLY:
+            else:
+                record = USER_REGISTRY[user.id]
+                if source != record.get("source") and not REGISTRY_READ_ONLY:
+                    logging.info(
+                        f"REGISTRY | source updated | user={user.id} | {record.get('source')} → {source}"
+                    )
                     record["source"] = source
                     if source == JoinSource.DISCORD:
                         record["labels"].add("discord_member")
                     if source == JoinSource.PAID:
                         record["labels"].add("paid_member")
                     save_user_registry()
-            else:
-                logging.info(f"REGISTRY | read-only skip | user={user.id}")
+                else:
+                    logging.info(f"REGISTRY | read-only skip | user={user.id}")
 
-        # --- HARD PROTECTION: never mute paid members ---
-        registry_record = USER_REGISTRY.get(user.id)
-        is_paid_member = False
-        if registry_record:
-            labels = registry_record.get("labels", set())
-            if isinstance(labels, set) and "paid_member" in labels:
-                is_paid_member = True
-
-        if is_paid_member:
-            logging.info(f"PAID_SKIP_MUTE | user={user.id} | chat={message.chat.id}")
-        elif (
-            FEATURE_MUTE_ENABLED
-            and CFG.mute_new_users
-            and perms["restrict"]
-            and not is_test_mode()
-            and not paid_like
-        ):
-            try:
-                await bot.restrict_chat_member(
-                    chat_id=cast(int, message.chat.id),
-                    user_id=cast(int, user.id),
-                    permissions=ChatPermissions(
-                        can_send_messages=False,
-                        can_send_media_messages=False,
-                        can_send_other_messages=False,
-                        can_add_web_page_previews=False
-                    ),
-                    until_date=int(time.time()) + int(CFG.mute_seconds)
-                )
-                logging.info(
-                    f"MUTED | user={user.id} | seconds={CFG.mute_seconds}"
-                )
-            except Exception as e:
-                logging.warning(
-                    f"MUTE FAILED | user={user.id} | error={e}"
-                )
+        await apply_mute_if_needed(
+            cast(int, message.chat.id),
+            cast(int, user.id),
+            source,
+            perms,
+            paid_like
+        )
 
         if FEATURE_WELCOME_ENABLED:
-            logging.info(
-                f"WELCOME_SENT | user={user.id} | source={source} | chat={message.chat.id}"
+            log_event(
+                "WELCOME_SENT",
+                user=user.id,
+                source=source,
+                chat=message.chat.id
             )
 
             lang = detect_lang(user.language_code)
-            raw_name = user.full_name or "User"
-            safe_name = html.escape(raw_name)
-            text = t(lang, "welcome").format(
-                name=safe_name,
-                project=CFG.project_name
-            )
-            # v1.5.2: Add badge after welcome text
-            badge = SOURCE_BADGES.get(source)
-            if badge and not is_test_mode():
-                text = text + f"\n\n<b>{badge}</b>"
-            if (not is_test_mode()) and source == JoinSource.DISCORD:
-                text = (
-                    text
-                    + "\n\n<i>Вы получили доступ как участник Discord‑сообщества проекта.</i>"
-                )
-
-            if is_test_mode():
-                text = (
-                    "🧪 <i>Test mode</i>\n"
-                    f"🧪 <i>Source: {source}</i>\n\n"
-                    + text
-                )
+            text = build_welcome_text(user, source, lang, invite_url)
 
             if CFG.welcome_delay_seconds > 0:
                 await asyncio.sleep(float(CFG.welcome_delay_seconds))
@@ -1048,6 +1135,10 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
     """
     # --- 1.4.1: detect join source from event
     source = detect_join_source_from_member_event(event)
+    invite_url = None
+    invite_obj = getattr(event, "invite_link", None)
+    if invite_obj and getattr(invite_obj, "invite_link", None):
+        invite_url = invite_obj.invite_link
 
     if event.old_chat_member.status in {"left", "kicked"} and event.new_chat_member.status == "member":
         user = event.new_chat_member.user
@@ -1070,98 +1161,58 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
             WELCOME_CACHE.clear()
             logging.warning("CACHE | WELCOME_CACHE cleared (limit exceeded)")
 
-        # --- 1.4.2: user registry with chat_id
-        if user.id not in USER_REGISTRY:
-            labels: Set[str] = set()
-            if source == JoinSource.DISCORD:
-                labels.add("discord_member")
-            if source == JoinSource.PAID:
-                labels.add("paid_member")
+        # --- 1.5.9.830: Absolute Tribute protection + auto label sync (protected with async lock) ---
+        async with REGISTRY_ASYNC_LOCK:
+            record = USER_REGISTRY.get(user.id)
 
-            USER_REGISTRY[user.id] = {
-                "source": source,
-                "labels": labels,
-                "first_seen": now,
-                "chat_id": cast(int, chat.id)
-            }
-            save_user_registry()
-            logging.info(
-                f"USER_JOIN | user={user.id} | source={source}"
-            )
-            if source == JoinSource.DISCORD:
+            if not record:
+                labels: Set[str] = set()
+                if source == JoinSource.DISCORD:
+                    labels.add("discord_member")
+                if source == JoinSource.PAID:
+                    labels.add("paid_member")
+
+                USER_REGISTRY[user.id] = {
+                    "source": source,
+                    "labels": labels,
+                    "first_seen": now,
+                    "chat_id": cast(int, chat.id)
+                }
+                save_user_registry()
                 logging.info(
-                    f"DISCORD_USER | user={user.id} | chat={chat.id}"
+                    f"USER_JOIN | user={user.id} | source={source}"
                 )
-        else:
-            logging.info(f"REGISTRY | read-only skip | user={user.id}")
+            else:
+                if source == JoinSource.PAID:
+                    labels = record.get("labels", set())
+                    if isinstance(labels, set) and "paid_member" not in labels:
+                        labels.add("paid_member")
+                        record["source"] = JoinSource.PAID
+                        save_user_registry()
+                        logging.info(
+                            f"PAID_AUTO_SYNC | user={user.id} | chat={chat.id}"
+                        )
+                else:
+                    logging.info(f"REGISTRY | existing user | user={user.id}")
 
         # --- sync mute logic for approved joins ---
         perms = await bot_has_permissions(cast(int, chat.id))
         # paid-like detection must use chat context, not ChatMember object
         paid_like = is_paid_like_chat(chat)
 
-        # --- HARD PROTECTION: never mute paid members ---
-        registry_record = USER_REGISTRY.get(user.id)
-        is_paid_member = False
-        if registry_record:
-            labels = registry_record.get("labels", set())
-            if isinstance(labels, set) and "paid_member" in labels:
-                is_paid_member = True
-
-        if is_paid_member:
-            logging.info(f"PAID_SKIP_MUTE | user={user.id} | chat={chat.id}")
-        elif (
-            FEATURE_MUTE_ENABLED
-            and CFG.mute_new_users
-            and perms["restrict"]
-            and not is_test_mode()
-            and not paid_like
-        ):
-            try:
-                await bot.restrict_chat_member(
-                    chat_id=cast(int, chat.id),
-                    user_id=cast(int, user.id),
-                    permissions=ChatPermissions(
-                        can_send_messages=False,
-                        can_send_media_messages=False,
-                        can_send_other_messages=False,
-                        can_add_web_page_previews=False
-                    ),
-                    until_date=int(time.time()) + int(CFG.mute_seconds)
-                )
-                logging.info(
-                    f"MUTED | user={user.id} | seconds={CFG.mute_seconds}"
-                )
-            except Exception as e:
-                logging.warning(
-                    f"MUTE FAILED | user={user.id} | error={e}"
-                )
+        await apply_mute_if_needed(
+            cast(int, chat.id),
+            cast(int, user.id),
+            source,
+            perms,
+            paid_like
+        )
 
         if not FEATURE_WELCOME_ENABLED:
             return
 
         lang = detect_lang(user.language_code)
-        raw_name = user.full_name or "User"
-        safe_name = html.escape(raw_name)
-        text = t(lang, "welcome").format(
-            name=safe_name,
-            project=CFG.project_name
-        )
-        # v1.5.2: Add badge after welcome text
-        badge = SOURCE_BADGES.get(source)
-        if badge and not is_test_mode():
-            text = text + f"\n\n<b>{badge}</b>"
-        if (not is_test_mode()) and source == JoinSource.DISCORD:
-            text = (
-                text
-                + "\n\n<i>Вы получили доступ как участник Discord‑сообщества проекта.</i>"
-            )
-        if is_test_mode():
-            text = (
-                "🧪 <i>Test mode</i>\n"
-                f"🧪 <i>Source: {source}</i>\n\n"
-                + text
-            )
+        text = build_welcome_text(user, source, lang, invite_url)
 
         try:
             msg = await bot.send_message(
@@ -1170,8 +1221,11 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
                 reply_markup=welcome_keyboard(lang)
             )
 
-            logging.info(
-                f"WELCOME_SENT | user={user.id} | source={source} | chat={chat.id}"
+            log_event(
+                "WELCOME_SENT",
+                user=user.id,
+                source=source,
+                chat=chat.id
             )
 
             async with BOT_MESSAGES_LOCK:
@@ -1676,7 +1730,17 @@ async def get_photo_file_id(message: Message):
 
 # --- Storage trigger anti-spam cache (v1.5.9.510) ---
 STORAGE_TRIGGER_CACHE: dict[int, float] = {}  # chat_id -> last trigger timestamp
+GLOBAL_RATE_LIMIT: dict[str, float] = {}
+GLOBAL_RATE_LIMIT_TTL = 2
 
+# --- Global rate limiter helper ---
+def global_rate_limit(key: str, ttl: int = GLOBAL_RATE_LIMIT_TTL) -> bool:
+    now = time.time()
+    last = GLOBAL_RATE_LIMIT.get(key)
+    if last and (now - last) < ttl:
+        return False
+    GLOBAL_RATE_LIMIT[key] = now
+    return True
 # TTL зависит от режима (test/prod)
 def get_storage_trigger_ttl() -> int:
     return 60 if is_test_mode() else 300  # 1 минута в test, 5 минут в prod
@@ -1686,6 +1750,9 @@ async def storage_keyword_trigger(message: Message):
         return
     chat_id = cast(int, message.chat.id)
     now = time.time()
+
+    if not global_rate_limit(f"storage:{chat_id}", 1):
+        return
 
     import re
 
@@ -1809,6 +1876,14 @@ async def cleanup_caches():
             ]
             for cid in expired_chats:
                 STORAGE_TRIGGER_CACHE.pop(cid, None)
+
+            # global rate limit cleanup
+            expired_rl = [
+                k for k, ts in GLOBAL_RATE_LIMIT.items()
+                if (now - ts) > GLOBAL_RATE_LIMIT_TTL
+            ]
+            for k in expired_rl:
+                GLOBAL_RATE_LIMIT.pop(k, None)
         except Exception as e:
             logging.warning(f"CACHE | cleanup failed | error={e}")
 
@@ -1853,7 +1928,22 @@ async def main():
     tasks.append(asyncio.create_task(cleanup_caches()))
 
     await asyncio.sleep(1)  # anti-flood startup delay
-    polling = asyncio.create_task(dp.start_polling(bot))
+    backoff = 1
+
+    async def start_polling_with_backoff():
+        nonlocal backoff
+        while not shutdown_event.is_set():
+            try:
+                logging.info(f"POLLING | starting (backoff={backoff}s)")
+                await dp.start_polling(bot)
+            except Exception as e:
+                logging.error(f"POLLING | crashed | error={e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+            else:
+                break
+
+    polling = asyncio.create_task(start_polling_with_backoff())
     tasks.append(polling)
 
     try:
