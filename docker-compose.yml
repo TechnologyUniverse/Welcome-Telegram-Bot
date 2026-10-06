@@ -1,0 +1,38 @@
+services:
+  welcome-bot:
+    image: ${WELCOME_BOT_IMAGE:?Set WELCOME_BOT_IMAGE to an immutable GHCR sha256 digest}
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in the local .env file}
+      PROJECT_NAME: ${PROJECT_NAME:-Technology Universe}
+      STORAGE_URL: ${STORAGE_URL-https://example.com/storage}
+      AUTO_DELETE_SECONDS: ${AUTO_DELETE_SECONDS:-60}
+      MUTE_SECONDS: ${MUTE_SECONDS:-120}
+      MUTE_NEW_USERS: ${MUTE_NEW_USERS:-true}
+      ADMIN_IDS: ${ADMIN_IDS:-}
+      ALLOWED_CHAT_IDS: ${ALLOWED_CHAT_IDS:-}
+      WELCOME_DELAY_SECONDS: ${WELCOME_DELAY_SECONDS:-3}
+      FAQ_URL: ${FAQ_URL:-}
+      SUPPORT_URL: ${SUPPORT_URL:-}
+      BOT_MODE: ${BOT_MODE:-prod}
+      WELCOME_IMAGE_URL: ${WELCOME_IMAGE_URL:-}
+      DATA_DIR: /data
+    volumes:
+      - /srv/storage/telegram/welcome-telegram-bot:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 0.25
+    mem_limit: 256m
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s

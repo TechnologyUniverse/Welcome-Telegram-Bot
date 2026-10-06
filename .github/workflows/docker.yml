@@ -1,0 +1,57 @@
+name: Publish container
+
+on:
+  push:
+    branches: [main]
+    tags: ['v1.6.0']
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.4"
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - name: Install dependencies
+        run: python -m pip install --require-hashes -r requirements-dev.lock
+      - name: Syntax check
+        run: python -m compileall -q Welcome_Bot.py healthcheck.py tests
+      - name: Unit tests
+        run: python -m pytest -q
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Prepare image tags
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ghcr.io/technologyuniverse/welcome-telegram-bot
+          flavor: |
+            latest=false
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=ref,event=tag
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            APP_VERSION=1.6.0
+      - name: Report image digest
+        run: 'echo "Published image digest: ${{ steps.build.outputs.digest }}"'

@@ -18,6 +18,11 @@ from dataclasses import dataclass
 import signal
 from typing import cast
 import html
+import fcntl
+import math
+import re
+from pathlib import Path
+from urllib.parse import urlsplit
 
 load_dotenv()
 
@@ -26,6 +31,45 @@ logging.basicConfig(
     level=logging.INFO,
     format='{"time":"%(asctime)s","level":"%(levelname)s","message":"%(message)s"}'
 )
+
+class SecretRedactionFilter(logging.Filter):
+    """Redact Telegram bot token-shaped values from application logs."""
+    TOKEN_PATTERN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
+    SECRET_QUERY_PATTERN = re.compile(
+        r"(?i)([?&](?:token|access_token|api_key|authorization|password|secret|key)=)[^&#\s]+"
+    )
+    AUTH_HEADER_PATTERN = re.compile(
+        r"(?i)(\b(?:authorization|proxy-authorization)\s*[:=]\s*)(?:(?:bearer|basic)\s+)?[^\s,;]+"
+    )
+    TOKEN_ASSIGNMENT_PATTERN = re.compile(r"(?i)(\bBOT_TOKEN\s*[=:]\s*)[^\s,;]+")
+    URL_CREDENTIAL_PATTERN = re.compile(r"(?i)(https?://)[^/@\s]+:[^/@\s]+@")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+            if record.exc_info:
+                message += "\n" + logging.Formatter().formatException(record.exc_info)
+                record.exc_info = None
+                record.exc_text = None
+            if record.stack_info:
+                message += "\n" + record.stack_info
+                record.stack_info = None
+            message = self.TOKEN_PATTERN.sub("[REDACTED_TOKEN]", message)
+            message = self.SECRET_QUERY_PATTERN.sub(r"\1[REDACTED]", message)
+            message = self.AUTH_HEADER_PATTERN.sub(r"\1[REDACTED]", message)
+            message = self.TOKEN_ASSIGNMENT_PATTERN.sub(r"\1[REDACTED]", message)
+            record.msg = self.URL_CREDENTIAL_PATTERN.sub(r"\1[REDACTED]@", message)
+            record.args = ()
+        except Exception:
+            record.msg = "[log message redacted]"
+            record.args = ()
+        return True
+
+
+_secret_filter = SecretRedactionFilter()
+logging.getLogger().addFilter(_secret_filter)
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_secret_filter)
 
 # Structured logging helper
 def log_event(event: str, **fields):
@@ -47,8 +91,8 @@ def log_event(event: str, **fields):
 
 
 # ================== VERSION ==================
-# v1.5.9.1000 — Async registry lock, mute logic hardening, registry mutation protection
-VERSION = "1.5.9.1000"
+# Stable release version.
+VERSION = "1.6.0"
 # v1.5.2 — Source → Badge (UX)
 # Branch 1.5.x started
 # Goal: user context, source attribution, badges, persistence preparation
@@ -56,41 +100,43 @@ VERSION = "1.5.9.1000"
 # ================== 1.4.5 UX & FLOOD SAFETY ==================
 # Simple single-instance lock to avoid parallel polling
 LOCK_FILE = "/tmp/welcome_bot.lock"
+_LOCK_FD: int | None = None
 # =============================================================
-import errno
-
 def acquire_startup_lock() -> bool:
-    if os.path.exists(LOCK_FILE):
-        try:
-            with open(LOCK_FILE, "r") as f:
-                pid = int(f.read().strip())
-
-            # Проверяем, жив ли процесс
-            os.kill(pid, 0)
-            logging.error(
-                f"STARTUP | lock exists, process alive | pid={pid}"
-            )
-            return False
-
-        except ValueError:
-            logging.warning("STARTUP | invalid lock file, recreating")
-        except ProcessLookupError:
-            logging.warning("STARTUP | stale lock detected, recreating")
-        except PermissionError:
-            logging.error("STARTUP | no permission to check PID")
-            return False
-        except OSError as e:
-            if e.errno != errno.ESRCH:
-                logging.error(f"STARTUP | lock check failed | error={e}")
-                return False
-
+    fd = None
     try:
-        with open(LOCK_FILE, "w") as f:
-            f.write(str(os.getpid()))
+        global _LOCK_FD
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(LOCK_FILE, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            logging.error("STARTUP | another bot process holds the startup lock")
+            return False
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        _LOCK_FD = fd
+        fd = None
         return True
     except Exception as e:
+        if fd is not None:
+            os.close(fd)
         logging.error(f"STARTUP | failed to create lock | error={e}")
         return False
+
+
+def release_startup_lock() -> None:
+    global _LOCK_FD
+    if _LOCK_FD is not None:
+        fd = _LOCK_FD
+        _LOCK_FD = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
 # ================== FEATURE FLAGS (1.3.x) ==================
 # ================== FEATURE FLAGS (1.3.x) ==================
 FEATURE_WELCOME_ENABLED = True
@@ -131,18 +177,7 @@ def sync_feature_flags():
     FEATURE_AUTODELETE_ENABLED = FEATURE_STATE["autodelete"]
     FEATURE_STORE.save(FEATURE_STATE)
 # ===========================================================
-# FEATURE:
-# Welcome message supports optional image via WELCOME_IMAGE_URL
-# FINAL RELEASE:
-# Версия 1.2.15 является финальной.
-# Ветка 1.2.x официально закрыта.
-# Допускаются только критические security-fix при необходимости.
-
-# ================== RELEASE STATUS ==================
-# Version 1.3.9
-# Branch 1.3.x frozen
-# Only critical fixes allowed
-# ================================================
+# Welcome message supports optional image via WELCOME_IMAGE_URL.
 
 START_TIME = time.time()
 
@@ -151,7 +186,7 @@ START_TIME = time.time()
 class Config:
     bot_token: str
     project_name: str
-    storage_url: str
+    storage_url: str | None
     auto_delete_seconds: int
     mute_new_users: bool
     mute_seconds: int
@@ -162,10 +197,75 @@ class Config:
     support_url: str | None
     bot_mode: str
     welcome_image_url: str | None
+    data_dir: str
 
 
 def _env_bool(key: str, default: bool) -> bool:
-    return os.getenv(key, str(default)).lower() == "true"
+    value = os.getenv(key, str(default)).strip().lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError(f"{key} must be true or false")
+    return value == "true"
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        value = int(os.getenv(key, str(default)))
+    except ValueError:
+        raise RuntimeError(f"{key} must be an integer") from None
+    if value < 0:
+        raise RuntimeError(f"{key} must be zero or greater")
+    return value
+
+
+def _parse_id_set(key: str) -> set[int]:
+    result: set[int] = set()
+    for entry in os.getenv(key, "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            parsed = int(entry)
+        except ValueError:
+            # Do not echo the rejected value: it could contain pasted credentials.
+            raise RuntimeError(f"{key} must contain comma-separated integer IDs") from None
+        if parsed == 0 or (key == "ADMIN_IDS" and parsed < 0):
+            raise RuntimeError(f"{key} contains an ID outside the allowed range")
+        result.add(parsed)
+    return result
+
+
+def validate_url(value: str | None, variable: str) -> str | None:
+    if value is None or value == "":
+        return None
+    if any(ord(char) <= 32 or ord(char) == 127 for char in value) or "\\" in value:
+        raise RuntimeError(f"{variable} must not contain whitespace or control characters")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"https", "http", "tg"}:
+        raise RuntimeError(f"{variable} must use https://, http://, or tg://")
+    if parsed.scheme in {"https", "http"} and (
+        not parsed.hostname or parsed.username is not None or parsed.password is not None or "@" in parsed.netloc
+    ):
+        raise RuntimeError(f"{variable} must be an absolute HTTP(S) URL without credentials")
+    if parsed.scheme == "tg" and not (parsed.netloc or parsed.path):
+        raise RuntimeError(f"{variable} must be an absolute tg:// URL")
+    return value
+
+
+def validate_welcome_image(value: str | None) -> str | None:
+    """Allow Telegram file IDs or safe HTTP(S) URLs for optional welcome art."""
+    if value is None or value == "":
+        return None
+    if len(value) > 2048 or any(ord(char) <= 32 or ord(char) == 127 for char in value):
+        raise RuntimeError("WELCOME_IMAGE_URL must be a valid Telegram file_id or HTTP(S) URL")
+    if "://" in value:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"https", "http"}:
+            raise RuntimeError("WELCOME_IMAGE_URL must use HTTP(S) or be a Telegram file_id")
+        return validate_url(value, "WELCOME_IMAGE_URL")
+    # Telegram file IDs are opaque strings; they are passed only to the Telegram API.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,512}", value):
+        raise RuntimeError("WELCOME_IMAGE_URL must be a valid Telegram file_id or HTTP(S) URL")
+    return value
 
 
 def load_config() -> Config:
@@ -176,51 +276,29 @@ def load_config() -> Config:
         )
 
     project_name = os.getenv("PROJECT_NAME", "Technology Universe")
-    storage_url = os.getenv("STORAGE_URL", "https://example.com/storage")
+    raw_storage_url = os.getenv("STORAGE_URL", "https://example.com/storage")
+    storage_url = validate_url(raw_storage_url, "STORAGE_URL")
 
-    try:
-        auto_delete_seconds = int(os.getenv("AUTO_DELETE_SECONDS", "60"))
-        mute_seconds = int(os.getenv("MUTE_SECONDS", "120"))
-    except ValueError:
-        raise RuntimeError("AUTO_DELETE_SECONDS и MUTE_SECONDS должны быть числами")
-
-    try:
-        welcome_delay_seconds = int(os.getenv("WELCOME_DELAY_SECONDS", "3"))
-    except ValueError:
-        raise RuntimeError("WELCOME_DELAY_SECONDS должен быть числом")
+    auto_delete_seconds = _env_int("AUTO_DELETE_SECONDS", 60)
+    mute_seconds = _env_int("MUTE_SECONDS", 120)
+    welcome_delay_seconds = _env_int("WELCOME_DELAY_SECONDS", 3)
 
     mute_new_users = _env_bool("MUTE_NEW_USERS", True)
 
-    admin_ids: set[int] = set()
-    raw_admin_ids = os.getenv("ADMIN_IDS", "")
-    for x in raw_admin_ids.split(","):
-        x = x.strip()
-        if not x:
-            continue
-        try:
-            admin_ids.add(int(x))
-        except ValueError:
-            logging.warning(f"ENV | invalid admin id ignored: {x}")
+    admin_ids = _parse_id_set("ADMIN_IDS")
+    allowed_chat_ids = _parse_id_set("ALLOWED_CHAT_IDS")
 
-    allowed_chat_ids: set[int] = set()
-    raw_chat_ids = os.getenv("ALLOWED_CHAT_IDS", "")
-    for x in raw_chat_ids.split(","):
-        x = x.strip()
-        if not x:
-            continue
-        try:
-            allowed_chat_ids.add(int(x))
-        except ValueError:
-            logging.warning(f"ENV | invalid chat id ignored: {x}")
-
-    faq_url = os.getenv("FAQ_URL")
-    support_url = os.getenv("SUPPORT_URL")
+    faq_url = validate_url(os.getenv("FAQ_URL"), "FAQ_URL")
+    support_url = validate_url(os.getenv("SUPPORT_URL"), "SUPPORT_URL")
 
     bot_mode = os.getenv("BOT_MODE", "prod").lower()
     if bot_mode not in {"prod", "test"}:
         raise RuntimeError("BOT_MODE должен быть prod или test")
 
-    welcome_image_url = os.getenv("WELCOME_IMAGE_URL")
+    welcome_image_url = validate_welcome_image(os.getenv("WELCOME_IMAGE_URL"))
+    data_dir = os.getenv("DATA_DIR", "/data").strip()
+    if not data_dir:
+        raise RuntimeError("DATA_DIR must not be empty")
 
     return Config(
         bot_token=bot_token,
@@ -236,6 +314,7 @@ def load_config() -> Config:
         support_url=support_url,
         bot_mode=bot_mode,
         welcome_image_url=welcome_image_url,
+        data_dir=data_dir,
     )
 # ================================================
 
@@ -290,7 +369,11 @@ SOURCE_BADGES = {
 
 # ================== USER REGISTRY STORAGE (1.5.3) ==================
 USER_REGISTRY: dict[int, UserRegistryItem] = {}
-USER_REGISTRY_FILE = "user_registry.json"
+DATA_DIR = Path(CFG.data_dir)
+USER_REGISTRY_FILE = str(DATA_DIR / "user_registry.json")
+MAX_REGISTRY_BYTES = 10 * 1024 * 1024
+MAX_REGISTRY_USERS = 100_000
+REGISTRY_PERSISTENCE_BLOCKED = False
 import threading
 REGISTRY_FILE_LOCK = threading.Lock()
 # Async registry lock for protecting registry mutations
@@ -306,12 +389,11 @@ def log_registry_mutation(admin_id: int, user_id: int, action: str, details: str
     )
 
 def save_user_registry():
+    if REGISTRY_PERSISTENCE_BLOCKED:
+        logging.error("REGISTRY | save skipped because registry load failed; source file preserved")
+        return
     with REGISTRY_FILE_LOCK:
         try:
-            import json
-            import tempfile
-            import os
-
             data = {
                 REGISTRY_META_KEY: REGISTRY_SCHEMA_VERSION,
                 "users": {
@@ -325,30 +407,52 @@ def save_user_registry():
                 }
             }
 
-            dir_name = os.path.dirname(os.path.abspath(USER_REGISTRY_FILE)) or "."
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                dir=dir_name,
-                delete=False
-            ) as tmp:
-                json.dump(data, tmp, ensure_ascii=False, indent=2)
-                tmp.flush()
-                os.fsync(tmp.fileno())
-                temp_name = tmp.name
-
-            os.replace(temp_name, USER_REGISTRY_FILE)
+            atomic_write_registry(data)
 
         except Exception as e:
             logging.error(f"REGISTRY | atomic save failed | error={e}")
 
 def load_user_registry():
+    global REGISTRY_PERSISTENCE_BLOCKED
     if not os.path.exists(USER_REGISTRY_FILE):
         return
+    REGISTRY_PERSISTENCE_BLOCKED = False
     try:
         import json
+        if os.path.getsize(USER_REGISTRY_FILE) > MAX_REGISTRY_BYTES:
+            raise ValueError(f"registry exceeds maximum size ({MAX_REGISTRY_BYTES} bytes)")
         with open(USER_REGISTRY_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
+
+        if not isinstance(raw, dict):
+            raise ValueError("registry root must be an object")
+        if "users" not in raw:
+            if REGISTRY_META_KEY in raw or any(not str(uid).isdigit() for uid in raw):
+                raise ValueError("registry root must contain a valid users section")
+            # Preserve the pre-schema flat user map and migrate it atomically below.
+            raw = {REGISTRY_META_KEY: 0, "users": raw}
+        if isinstance(raw.get(REGISTRY_META_KEY, 0), bool) or not isinstance(raw.get(REGISTRY_META_KEY, 0), int):
+            raise ValueError("registry schema version must be an integer")
+        users = raw.get("users", {})
+        if not isinstance(users, dict) or len(users) > MAX_REGISTRY_USERS:
+            raise ValueError("registry users must be an object within the configured limit")
+        for uid, data in users.items():
+            if not str(uid).isascii() or not str(uid).isdecimal() or len(str(uid)) > 20 or not isinstance(data, dict):
+                raise ValueError("registry contains an invalid user record")
+            if not isinstance(data.get("source", JoinSource.TELEGRAM), str):
+                raise ValueError("registry user source must be a string")
+            labels = data.get("labels", [])
+            if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
+                raise ValueError("registry user labels must be a list")
+            first_seen = data.get("first_seen", time.time())
+            if (
+                isinstance(first_seen, bool)
+                or not isinstance(first_seen, (int, float))
+                or not math.isfinite(first_seen)
+            ):
+                raise ValueError("registry first_seen must be numeric")
+            if isinstance(data.get("chat_id", 0), bool) or not isinstance(data.get("chat_id", 0), int):
+                raise ValueError("registry chat_id must be an integer")
 
         schema_version = raw.get(REGISTRY_META_KEY, 0)
         if schema_version != REGISTRY_SCHEMA_VERSION:
@@ -358,8 +462,7 @@ def load_user_registry():
             # safe auto-upgrade: only update meta version without altering user data
             raw[REGISTRY_META_KEY] = REGISTRY_SCHEMA_VERSION
             try:
-                with open(USER_REGISTRY_FILE, "w", encoding="utf-8") as wf:
-                    json.dump(raw, wf, ensure_ascii=False, indent=2)
+                atomic_write_registry(raw)
                 logging.info("REGISTRY | schema version auto-upgraded safely")
             except Exception as e:
                 logging.error(f"REGISTRY | auto-upgrade failed | error={e}")
@@ -377,6 +480,7 @@ def load_user_registry():
             f"REGISTRY | loaded {len(USER_REGISTRY)} users | schema=v{schema_version}"
         )
     except Exception as e:
+        REGISTRY_PERSISTENCE_BLOCKED = True
         logging.error(f"REGISTRY | load failed | error={e}")
 
 # --- Registry schema validator ---
@@ -386,13 +490,40 @@ def validate_registry_schema() -> tuple[bool, str]:
 
     try:
         import json
+        if os.path.getsize(USER_REGISTRY_FILE) > MAX_REGISTRY_BYTES:
+            return False, "Registry exceeds maximum size"
         with open(USER_REGISTRY_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
+
+        if not isinstance(raw, dict):
+            return False, "Registry root must be an object"
+
+        users = raw.get("users")
+        if not isinstance(users, dict) or len(users) > MAX_REGISTRY_USERS:
+            return False, "Invalid users section"
+        for uid, data in users.items():
+            if not str(uid).isascii() or not str(uid).isdecimal() or len(str(uid)) > 20 or not isinstance(data, dict):
+                return False, "Invalid user record"
+            labels = data.get("labels", [])
+            first_seen = data.get("first_seen", 0)
+            chat_id = data.get("chat_id", 0)
+            if not isinstance(data.get("source", JoinSource.TELEGRAM), str):
+                return False, "Invalid user source"
+            if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
+                return False, "Invalid user labels"
+            if isinstance(first_seen, bool) or not isinstance(first_seen, (int, float)) or not math.isfinite(first_seen):
+                return False, "Invalid first_seen value"
+            if isinstance(chat_id, bool) or not isinstance(chat_id, int):
+                return False, "Invalid chat_id value"
 
         if REGISTRY_META_KEY not in raw:
             return False, "Missing schema version"
 
-        if raw[REGISTRY_META_KEY] != REGISTRY_SCHEMA_VERSION:
+        if (
+            isinstance(raw[REGISTRY_META_KEY], bool)
+            or not isinstance(raw[REGISTRY_META_KEY], int)
+            or raw[REGISTRY_META_KEY] != REGISTRY_SCHEMA_VERSION
+        ):
             return False, f"Schema mismatch: {raw[REGISTRY_META_KEY]} != {REGISTRY_SCHEMA_VERSION}"
 
         if "users" not in raw or not isinstance(raw["users"], dict):
@@ -401,6 +532,59 @@ def validate_registry_schema() -> tuple[bool, str]:
         return True, "Schema valid"
     except Exception as e:
         return False, f"Validation error: {e}"
+
+
+def atomic_write_registry(data: dict) -> None:
+    import json
+    import tempfile
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=DATA_DIR, delete=False) as tmp:
+            temp_name = tmp.name
+            json.dump(data, tmp, ensure_ascii=False, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, USER_REGISTRY_FILE)
+        directory_fd = os.open(DATA_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.remove(temp_name)
+
+
+def create_registry_backup() -> Path:
+    """Create an atomic, private backup without touching the live registry."""
+    import tempfile
+
+    backup_dir = DATA_DIR / "backups"
+    backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.path.getsize(USER_REGISTRY_FILE) > MAX_REGISTRY_BYTES:
+        raise ValueError("registry exceeds maximum size")
+    timestamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    fd, temp_name = tempfile.mkstemp(prefix=".registry-backup-", dir=backup_dir)
+    backup_path = Path(temp_name)
+    target_path = backup_dir / f"user_registry_backup_{timestamp}_{time.time_ns()}.json"
+    try:
+        with os.fdopen(fd, "wb") as destination, open(USER_REGISTRY_FILE, "rb") as source:
+            os.chmod(backup_path, 0o600)
+            while chunk := source.read(64 * 1024):
+                destination.write(chunk)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(backup_path, target_path)
+        directory_fd = os.open(backup_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return target_path
+    finally:
+        backup_path.unlink(missing_ok=True)
 
 # --- Dry-run migration stub ---
 def dry_run_migration(target_version: int) -> str:
@@ -418,11 +602,11 @@ def apply_migration(target_version: int) -> str:
     return (
         f"⛔ Migration blocked\n\n"
         f"Target version: v{target_version}\n"
-        f"Reason: apply_migration is disabled in v1.5.9\n"
+        f"Reason: apply_migration is disabled in this release\n"
         f"Use --dry-run only"
     )
 
-# --- v1.5.9: controlled migration apply (preview, blocked by flag) ---
+# Controlled migration apply (preview, blocked by flag).
 MIGRATION_APPLY_ENABLED = False  # hard safety switch
 
 def apply_migration_controlled(target_version: int, admin_id: int) -> str:
@@ -467,7 +651,7 @@ async def registry_schema_cmd(message: Message):
         f"<b>Registry schema</b>\n"
         f"Version: v{REGISTRY_SCHEMA_VERSION}\n"
         f"Status: {status}\n"
-        f"Info: {info}"
+        f"Info: {html.escape(info)}"
     )
 
 # --- v1.5.8: Registry migration plan preview command ---
@@ -532,7 +716,7 @@ async def registry_migrate_cmd(message: Message):
     )
     await admin_reply(message, text)
 
-# --- v1.5.9: Registry controlled apply command (preview, blocked by flag) ---
+# Registry controlled apply command (preview, blocked by flag).
 @dp.message(F.text.startswith("/registry_apply "))
 async def registry_apply_cmd(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
@@ -727,7 +911,7 @@ def is_test_mode() -> bool:
 
 def get_message_ttl(msg_type: str) -> int:
     """
-    v1.5.9.x — Unified auto-delete policy
+    Unified auto-delete policy
 
     • In TEST mode → short TTL (60s)
     • In PROD mode → ALL bot messages use CFG.auto_delete_seconds
@@ -752,7 +936,7 @@ def is_control_allowed(message: Message) -> bool:
 
 # Admin reply helper
 async def admin_reply(message: Message, text: str):
-    # v1.5.9.210 — Ephemeral admin replies
+    # Ephemeral admin replies.
 
     try:
         msg = await message.answer(text)
@@ -814,14 +998,10 @@ def t(lang: str, key: str) -> str:
 
 
 def welcome_keyboard(lang: str) -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text=t(lang, "btn_storage"),
-                url=CFG.storage_url
-            )
-        ],
-        [
+    buttons = []
+    if CFG.storage_url:
+        buttons.append([InlineKeyboardButton(text=t(lang, "btn_storage"), url=CFG.storage_url)])
+    buttons.append([
             InlineKeyboardButton(
                 text=t(lang, "btn_rules"),
                 callback_data=f"rules:{lang}"
@@ -830,8 +1010,7 @@ def welcome_keyboard(lang: str) -> InlineKeyboardMarkup:
                 text=t(lang, "btn_about"),
                 callback_data=f"about:{lang}"
             )
-        ]
-    ]
+        ])
 
     extra = []
     if CFG.faq_url:
@@ -882,7 +1061,7 @@ def is_paid_like_chat(chat) -> bool:
         or getattr(chat, "join_to_send_messages", False)
     )
 
-# --- v1.5.9.840: Centralized paid detection ---
+# Centralized paid detection.
 def is_paid_member(user_id: int, source: str | None = None) -> bool:
     if source == JoinSource.PAID:
         return True
@@ -895,14 +1074,14 @@ def is_paid_member(user_id: int, source: str | None = None) -> bool:
     return isinstance(labels, set) and "paid_member" in labels
 
 
-# --- v1.5.9.840: Centralized welcome builder ---
+# Centralized welcome builder.
 def build_welcome_text(user, source: str, lang: str, invite_url: str | None = None) -> str:
     raw_name = user.full_name or "User"
     safe_name = html.escape(raw_name)
 
     text = t(lang, "welcome").format(
         name=safe_name,
-        project=CFG.project_name
+        project=html.escape(CFG.project_name)
     )
 
     badge = SOURCE_BADGES.get(source)
@@ -937,7 +1116,7 @@ async def apply_mute_if_needed(
         log_event("PAID_SKIP_MUTE", user=user_id, chat=chat_id)
         return
 
-    # v1.5.9.901 — Do not mute users joined via regular invite link
+    # Do not mute users joined via regular invite link.
     if source == JoinSource.INVITE_LINK:
         log_event("INVITE_SKIP_MUTE", user=user_id, chat=chat_id)
         return
@@ -1125,7 +1304,7 @@ async def welcome_new_user(message: Message):
                     BOT_MESSAGES_CHAT_ID[msg.message_id] = cast(int, message.chat.id)
 
 
-# --- v1.3.9.18: Welcome for invite link & paid join approval ---
+# Welcome for invite link and approved joins.
 @dp.chat_member()
 async def welcome_on_approved_join(event: ChatMemberUpdated):
     """
@@ -1161,7 +1340,7 @@ async def welcome_on_approved_join(event: ChatMemberUpdated):
             WELCOME_CACHE.clear()
             logging.warning("CACHE | WELCOME_CACHE cleared (limit exceeded)")
 
-        # --- 1.5.9.830: Absolute Tribute protection + auto label sync (protected with async lock) ---
+        # Paid access protection and automatic label synchronization.
         async with REGISTRY_ASYNC_LOCK:
             record = USER_REGISTRY.get(user.id)
 
@@ -1369,7 +1548,7 @@ async def version_cmd(message: Message):
     await message.answer(
         "ℹ️ <b>Welcome Bot</b>\n"
         f"Version: {VERSION}\n"
-        "Channel: Stable (1.5.x)"
+        "Channel: Stable (1.6.x)"
     )
 
 @dp.message(F.text == "/health")
@@ -1552,9 +1731,9 @@ async def registry_set_cmd(message: Message):
             message.from_user.id,
             target_user,
             "set_source",
-            f"{old} → {value}"
+            f"{html.escape(old)} → {html.escape(value)}"
         )
-        await admin_reply(message, f"✅ source updated: {old} → {value}")
+        await admin_reply(message, f"✅ source updated: {html.escape(old)} → {html.escape(value)}")
         return
 
     if action == "add_label":
@@ -1570,7 +1749,7 @@ async def registry_set_cmd(message: Message):
             "add_label",
             value
         )
-        await admin_reply(message, f"✅ label added: {value}")
+        await admin_reply(message, f"✅ label added: {html.escape(value)}")
         return
 
     if action == "remove_label":
@@ -1586,7 +1765,7 @@ async def registry_set_cmd(message: Message):
             "remove_label",
             value
         )
-        await admin_reply(message, f"✅ label removed: {value}")
+        await admin_reply(message, f"✅ label removed: {html.escape(value)}")
         return
 
     await admin_reply(message, "❌ Unknown action")
@@ -1625,8 +1804,8 @@ async def whois_cmd(message: Message):
     reply_text = (
         f"<b>User info</b>\n"
         f"• user_id: <code>{user_id}</code>\n"
-        f"• source: <code>{source}</code>\n"
-        f"• labels: <code>{labels}</code>\n"
+        f"• source: <code>{html.escape(str(source))}</code>\n"
+        f"• labels: <code>{html.escape(str(labels))}</code>\n"
         f"• first_seen: <code>{int(first_seen)}</code>\n"
         f"• chat_id: <code>{chat_id}</code>"
     )
@@ -1657,7 +1836,7 @@ async def export_registry_cmd(message: Message):
         first_seen = int(info["first_seen"])
         chat_id = info["chat_id"]
         lines.append(
-            f"{uid} | {source} | {labels_str} | {first_seen} | {chat_id}"
+            f"{uid} | {html.escape(str(source))} | {html.escape(labels_str)} | {first_seen} | {chat_id}"
         )
 
     text = "<b>User Registry Export</b>\n\n" + "\n".join(lines)
@@ -1676,13 +1855,11 @@ async def registry_backup_cmd(message: Message):
         await admin_reply(message, "ℹ️ Registry file not found")
         return
 
-    backup_name = f"user_registry_backup_{int(time.time())}.json"
     try:
-        import shutil
-        shutil.copy(USER_REGISTRY_FILE, backup_name)
-        await admin_reply(message, f"✅ Backup created:\n<code>{backup_name}</code>")
+        backup_name = create_registry_backup()
+        await admin_reply(message, f"✅ Backup created:\n<code>{html.escape(str(backup_name))}</code>")
     except Exception as e:
-        await admin_reply(message, f"❌ Backup failed: {e}")
+        await admin_reply(message, f"❌ Backup failed: {html.escape(str(e))}")
 
 # ===== /registry_stats admin command =====
 @dp.message(F.text == "/registry_stats")
@@ -1701,7 +1878,7 @@ async def registry_stats_cmd(message: Message):
 
     lines = [f"👥 Total users: {total}\n"]
     for src, count in sources.items():
-        lines.append(f"• {src}: {count}")
+        lines.append(f"• {html.escape(str(src))}: {count}")
 
     await admin_reply(message, "<b>Registry stats</b>\n\n" + "\n".join(lines))
 
@@ -1726,9 +1903,9 @@ async def get_photo_file_id(message: Message):
         "ℹ️ Используйте этот file_id в WELCOME_IMAGE_URL"
     )
 
-# ===== v1.5.9.500 — Keyword trigger: "Хранилище" =====
+# Keyword trigger: "Хранилище".
 
-# --- Storage trigger anti-spam cache (v1.5.9.510) ---
+# Storage trigger anti-spam cache.
 STORAGE_TRIGGER_CACHE: dict[int, float] = {}  # chat_id -> last trigger timestamp
 GLOBAL_RATE_LIMIT: dict[str, float] = {}
 GLOBAL_RATE_LIMIT_TTL = 2
@@ -1747,6 +1924,8 @@ def get_storage_trigger_ttl() -> int:
 @dp.message(F.text)
 async def storage_keyword_trigger(message: Message):
     if not message.text:
+        return
+    if not CFG.storage_url:
         return
     chat_id = cast(int, message.chat.id)
     now = time.time()
@@ -1890,6 +2069,26 @@ async def cleanup_caches():
         await asyncio.sleep(300)  # каждые 5 минут
 
 shutdown_event = asyncio.Event()
+HEALTH_FILE = "/tmp/welcome_bot_health"
+
+
+async def write_health_heartbeat():
+    """Refresh a local liveness marker; does not contact Telegram."""
+    import tempfile
+
+    while not shutdown_event.is_set():
+        temp_path = None
+        try:
+            fd, temp_path = tempfile.mkstemp(prefix=".welcome_bot_health-", dir="/tmp")
+            with os.fdopen(fd, "w", encoding="ascii") as health_file:
+                health_file.write(str(os.getpid()))
+            os.replace(temp_path, HEALTH_FILE)
+        except OSError as e:
+            logging.warning(f"HEALTH | heartbeat write failed | error={e}")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+        await asyncio.sleep(20)
 
 
 def _handle_shutdown():
@@ -1907,7 +2106,7 @@ async def main():
         f"delay={CFG.welcome_delay_seconds}s "
         f"autodelete={CFG.auto_delete_seconds}s"
     )
-    logging.info(f"BUILD | version={VERSION} channel=stable-1.5.x")
+    logging.info(f"BUILD | version={VERSION} channel=stable-1.6.x")
     if not CFG.admin_ids:
         logging.warning("ENV | ADMIN_IDS is empty")
 
@@ -1922,6 +2121,7 @@ async def main():
         pass
     logging.info("RUNTIME | async lifecycle guards enabled")
     tasks = []
+    tasks.append(asyncio.create_task(write_health_heartbeat()))
 
     # Cleanup tasks enabled in all modes (safe for test-mode)
     tasks.append(asyncio.create_task(cleanup_bot_messages()))
@@ -1963,8 +2163,7 @@ async def main():
 
     save_user_registry()
     try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
+        release_startup_lock()
     except Exception:
         pass
 
@@ -1978,7 +2177,6 @@ if __name__ == "__main__":
         logging.info("SHUTDOWN | KeyboardInterrupt received (Ctrl+C)")
         shutdown_event.set()
         try:
-            if os.path.exists(LOCK_FILE):
-                os.remove(LOCK_FILE)
+            release_startup_lock()
         except Exception:
             pass

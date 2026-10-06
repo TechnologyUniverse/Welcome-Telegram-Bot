@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.4"
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - name: Install dependencies
+        run: python -m pip install --require-hashes -r requirements-dev.lock
+      - name: Syntax check
+        run: python -m compileall -q Welcome_Bot.py healthcheck.py tests
+      - name: Unit tests
+        run: python -m pytest -q
+      - name: Validate workflow YAML
+        run: |
+          ruby -e 'require "yaml"; ARGV.each { |f| YAML.load_file(f); puts "valid YAML: #{f}" }' \
+            .github/workflows/ci.yml .github/workflows/docker.yml
+      - name: Validate Docker Compose
+        env:
+          BOT_TOKEN: ci-placeholder
+          WELCOME_BOT_IMAGE: ghcr.io/technologyuniverse/welcome-telegram-bot@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        run: docker compose config -q
+      - name: Check patch whitespace
+        run: git diff --check "${{ github.event.pull_request.base.sha || github.event.before }}...HEAD"
+      - name: Build Docker image (no publish)
+        run: docker build --tag welcome-telegram-bot:ci .
