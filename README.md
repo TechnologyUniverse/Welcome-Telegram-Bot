@@ -1,3 +1,7 @@
+## Release 1.6.1
+
+Storage Update Manager is documented in [docs/storage-updates](docs/storage-updates/README.md). Notifications are opt-in; existing files are baselined without announcements.
+
 # Welcome Telegram Bot
 
 **Version:** `1.6.0`

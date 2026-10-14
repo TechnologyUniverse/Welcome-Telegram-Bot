@@ -1,0 +1,79 @@
+--- a/finder/server/main.mjs
++++ b/finder/server/main.mjs
+@@ -1,4 +1,5 @@
+ import http from "node:http";
++import { storageFeed } from "./storage-feed.mjs";
+ import { readFile } from "node:fs/promises";
+ import { pipeline } from "node:stream/promises";
+ import { Readable } from "node:stream";
+@@ -172,6 +173,8 @@
+     const u = new URL(req.url, origin),
+       p = u.pathname,
+       method = req.method;
++    if (p === "/api/integrations/storage-updates" && method === "GET")
++      return json(res, await storageFeed(req, u, db, s3));
+     if (p === "/healthz") return json(res, { ok: true, version: "2.0.0" });
+     if (staticTypes[p] && ["GET", "HEAD"].includes(method)) {
+       const data = await readFile(new URL("../public" + p, import.meta.url));
+--- /dev/null
++++ b/finder/server/storage-feed.mjs
+@@ -0,0 +1,31 @@
++// Opt-in, read-only metadata feed for the existing Welcome Bot. No download credentials.
++import {timingSafeEqual} from 'node:crypto';
++import {all, get} from './db.mjs';
++import {Fault} from './security.mjs';
++const blocked = /(^|\/)(\.|private(?:\/|$)|secrets?(?:\/|$)|backups?(?:\/|$)|configs?(?:\/|$)|credentials(?:\/|$)|node_modules(?:\/|$))|\.(env|pem|key|p12|pfx|sqlite|db|sql|dump|toml|ini|ya?ml|conf|config|json|part|partial|tmp|crdownload|download|swp)$/i;
++export function eligible(key, prefixes) {
++  return typeof key === 'string' && !key.startsWith('/') && !/[\\\x00-\x1f]/.test(key) && !key.split('/').some(x=>x==='..'||x==='') && !blocked.test(key) && !/^(secrets?|tokens?|passwords?|credentials|backups?|configs?)\./i.test(key.split('/').pop()) && prefixes.some(p=>key.startsWith(p));
++}
++export async function storageFeed(req, url, db, s3, env=process.env) {
++  const secret = env.STORAGE_EVENTS_API_TOKEN || '';
++  if(secret.length < 32) throw new Fault(404,'Not found');
++  const expected=Buffer.from('Bearer '+secret), supplied=Buffer.from(req.headers.authorization||'');
++  if(expected.length!==supplied.length || !timingSafeEqual(expected,supplied)) throw new Fault(401,'Unauthorized');
++  const prefixes=(env.STORAGE_EVENTS_ALLOWED_PREFIXES||'').split('|').map(s=>s.trim()).filter(Boolean);
++  if(!prefixes.length || prefixes.some(p=>!p.endsWith('/')||p.startsWith('/')||p.includes('..'))) throw new Fault(503,'Feed not configured');
++  const root=env.S3_PREFIX||'Для канала/';
++  const indexed=get(db,"SELECT value FROM meta WHERE key='indexed_at'")?.value;
++  const jobs=!!get(db,"SELECT id FROM jobs WHERE status IN ('queued','running','failed') LIMIT 1");
++  const uploads=all(db,"SELECT key FROM uploads WHERE status NOT IN ('done','cancelled','aborted')");
++  const busy=new Set(uploads.map(x=>x.key));
++  const id=url.searchParams.get('id');
++  if(id){
++    const f=get(db,'SELECT id,key,size,etag,folder FROM files WHERE id=?',id);
++    if(!f || f.folder || !eligible(f.key,prefixes) || busy.has(f.key) || jobs) return {available:false};
++    try {
++      const h=await s3.head(f.key);
++      return {available:h.ContentLength===f.size && h.ETag===f.etag, size:h.ContentLength,etag:h.ETag};
++    } catch(e){if(e.$metadata?.httpStatusCode===404)return {available:false};throw new Fault(503,'Storage unavailable');}
++  }
++  return {schema:1,root,ready:!!indexed&&!jobs,uploading:uploads.some(x=>eligible(x.key,prefixes)),files:all(db,'SELECT id,key,size,etag,modified FROM files WHERE folder=0').filter(f=>eligible(f.key,prefixes)).map(f=>({id:f.id,path:f.key,size:f.size,etag:f.etag,modified:f.modified,busy:busy.has(f.key)}))};
++}
+--- /dev/null
++++ b/finder/tests/storage-feed.test.mjs
+@@ -0,0 +1,25 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {mkdtempSync,rmSync} from 'node:fs';
++import {tmpdir} from 'node:os';
++import {join} from 'node:path';
++import {storageFeed,eligible} from '../server/storage-feed.mjs';
++import {openDB} from '../server/db.mjs';
++test('storage feed: opt-in, scoped auth, completed files only',async()=>{
++ const dir=mkdtempSync(join(tmpdir(),'storage-feed-'));const db=openDB(dir);
++ try {
++  db.prepare("INSERT INTO meta VALUES('indexed_at','now')").run();
++  db.prepare('INSERT INTO files(id,key,size,etag,folder) VALUES(?,?,?,?,0)').run('file','Программы для Mac/a.dmg',10,'etag');
++  db.prepare('INSERT INTO files(id,key,size,etag,folder) VALUES(?,?,?,?,0)').run('secret','Программы для Mac/.env',10,'secret');
++  const env={STORAGE_EVENTS_API_TOKEN:'x'.repeat(40),STORAGE_EVENTS_ALLOWED_PREFIXES:'Программы для Mac/'};
++  const req={headers:{authorization:'Bearer '+env.STORAGE_EVENTS_API_TOKEN}},url=new URL('https://local/api/integrations/storage-updates');
++  await assert.rejects(storageFeed(req,url,db,{},{}));
++  await assert.rejects(storageFeed({headers:{}},url,db,{},env));
++  const result=await storageFeed(req,url,db,{},env);assert.equal(result.files.length,1);assert.equal(result.root,'Для канала/');
++  url.searchParams.set('id','file');const storage={head:async()=>({ContentLength:10,ETag:'etag'})};
++  assert.equal((await storageFeed(req,url,db,storage,env)).available,true);
++  db.prepare("INSERT INTO uploads(id,key,status) VALUES('upload','Программы для Mac/a.dmg','uploading')").run();
++  assert.equal((await storageFeed(req,url,db,storage,env)).available,false);
++  for(const key of ['Программы для Mac/config.json','Программы для Mac/credentials.zip','Программы для Mac/../a.dmg','private/a.dmg'])assert.equal(eligible(key,['Программы для Mac/']),false);
++ } finally {db.close();rmSync(dir,{recursive:true,force:true});}
++});

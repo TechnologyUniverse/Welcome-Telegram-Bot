@@ -3,7 +3,7 @@ name: Publish container
 on:
   push:
     branches: [main]
-    tags: ['v1.6.0']
+    tags: ['v1.6.1']
 
 permissions:
   contents: read

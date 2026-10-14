@@ -1,0 +1,8 @@
+# Overlay to the existing Compose; not a second bot instance.
+services:
+  welcome-telegram-bot:
+    image: technology-universe-welcome:1.6.1
+    env_file:
+      - ./storage.env
+    # Current /data volume, token, restart policy and resource limits remain inherited.
+    # No S3 credentials, no new ports, no filesystem mount of storage/admin SQLite.

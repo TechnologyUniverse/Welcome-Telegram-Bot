@@ -9,13 +9,15 @@ RUN groupadd --gid 10001 bot \
     && mkdir -p /app /data \
     && chown 10001:10001 /data
 
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-ARG APP_VERSION=1.6.0
+ARG APP_VERSION=1.6.1
 LABEL org.opencontainers.image.version=${APP_VERSION}
 COPY requirements.lock ./requirements.lock
 RUN python -m pip install --no-cache-dir --require-hashes -r requirements.lock
 
-COPY Welcome_Bot.py healthcheck.py ./
+COPY Welcome_Bot.py healthcheck.py storage_updates.py storage_adapter.py ./
 USER 10001:10001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \

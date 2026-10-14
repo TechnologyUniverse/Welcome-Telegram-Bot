@@ -1,3 +1,10 @@
+# 1.6.1 — 2026-10-14
+
+- Add Storage Update Manager with persistent batching, scoped metadata feed, group-only announcements and covers.
+- Add storage administration commands and safe baseline/retry behavior.
+- Preserve production community rules.
+- Handle chunked metadata responses completely before JSON decoding.
+
 # Changelog
 
 ## 1.6.0
