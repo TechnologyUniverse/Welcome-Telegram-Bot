@@ -22,3 +22,6 @@ tests/
 *.pem
 *.key
 *.crt
+
+!assets/
+!assets/storage-notification.png

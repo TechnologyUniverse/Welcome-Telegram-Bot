@@ -15,11 +15,10 @@ from storage_updates import Config, State, Manager, RetryDelivery, UncertainDeli
 
 
 def cover(files, now, config):
+    if config.template:
+        return Path(config.template).read_bytes()
     from PIL import Image, ImageDraw, ImageFont
     image = Image.new('RGB', (1200, 630), '#0a1025')
-    if config.template:
-        with Image.open(config.template) as template:
-            image = template.convert('RGB').resize((1200, 630))
     draw = ImageDraw.Draw(image)
     for y in range(630):
         if not config.template:

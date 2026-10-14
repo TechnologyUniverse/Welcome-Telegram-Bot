@@ -18,6 +18,8 @@ COPY requirements.lock ./requirements.lock
 RUN python -m pip install --no-cache-dir --require-hashes -r requirements.lock
 
 COPY Welcome_Bot.py healthcheck.py storage_updates.py storage_adapter.py ./
+COPY --chown=10001:10001 assets/storage-notification.png /app/assets/storage-notification.png
+ENV STORAGE_COVER_TEMPLATE=/app/assets/storage-notification.png
 USER 10001:10001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
