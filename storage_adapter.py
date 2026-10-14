@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 import aiohttp
 from aiogram import F
 from aiogram.filters import Command
@@ -59,8 +60,12 @@ class Service:
         value = await self.request({'id': f['id']})
         return value.get('available') and value.get('size') == f['size'] and value.get('etag') == f['etag']
 
-    def button(self):
-        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📥 ОТКРЫТЬ ХРАНИЛИЩЕ', url=self.cfg.public_url)]])
+    def button(self, files=None):
+        folders = {str(Path(f['path']).parent) for f in (files or [])}
+        folder = next(iter(folders)) if len(folders) == 1 else ''
+        if folder == '.': folder = ''
+        url = self.cfg.public_url.rstrip('/') + '/library?folder=' + quote(folder, safe='')
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📥 ОТКРЫТЬ ХРАНИЛИЩЕ', url=url)]])
 
     async def destination(self):
         chat = await self.bot.get_chat(self.cfg.chat_id)
@@ -87,9 +92,9 @@ class Service:
             except Exception: self.state.error('cover_generation_failed', now)
         try:
             if art:
-                result = await self.bot.send_photo(self.cfg.chat_id, BufferedInputFile(art, filename='storage-update.jpg'), caption=text, parse_mode='HTML', reply_markup=self.button())
+                result = await self.bot.send_photo(self.cfg.chat_id, BufferedInputFile(art, filename='storage-update.jpg'), caption=text, parse_mode='HTML', reply_markup=self.button(files))
             else:
-                result = await self.bot.send_message(self.cfg.chat_id, text, parse_mode='HTML', reply_markup=self.button())
+                result = await self.bot.send_message(self.cfg.chat_id, text, parse_mode='HTML', reply_markup=self.button(files))
             return result.message_id
         except TelegramRetryAfter as e: raise RetryDelivery(e.retry_after + 1) from None
         except (TelegramNetworkError, TelegramServerError): raise UncertainDelivery() from None
@@ -117,7 +122,7 @@ class Service:
             d = self.state.data
             if name == '/storage':
                 last = self.date(d['last_publish'])
-                await message.answer(f'📦 <b>Хранилище Technology Universe</b>\nПоследнее обновление: {last}', reply_markup=self.button())
+                await message.answer(f'📦 <b>Хранилище Technology Universe</b>\nПоследнее обновление: {last}', reply_markup=self.button(files))
             elif name == '/storage_enable':
                 try:
                     await self.destination()
@@ -156,7 +161,17 @@ class Service:
             while not stop.is_set():
                 try:
                     if self.cfg.api_url:
-                        await self.manager.observe(await self.request())
+                        snapshot = await self.request()
+                        monitor = snapshot.get('monitor', {})
+                        if monitor.get('alertPending') and time.time() - self.state.data.get('last_monitor_alert', 0) > 3600:
+                            for user_id in self.admin_ids:
+                                try:
+                                    await self.bot.send_message(user_id, '⚠️ Хранилище требует проверки.\nОшибок операций: ' + str(int(monitor.get('failedJobs', 0))) + '\nЗависших загрузок: ' + str(int(monitor.get('staleUploads', 0))) + '\n' + self.cfg.public_url + '/admin')
+                                except Exception:
+                                    self.state.error('monitor_alert_failed', time.time())
+                            self.state.data['last_monitor_alert'] = time.time()
+                            self.state.save()
+                        await self.manager.observe(snapshot)
                     else: self.manager.health = 'not_configured'
                 except asyncio.CancelledError: raise
                 except Exception as e:
