@@ -12,7 +12,7 @@ RUN groupadd --gid 10001 bot \
 RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-ARG APP_VERSION=1.6.1
+ARG APP_VERSION=1.7.0
 LABEL org.opencontainers.image.version=${APP_VERSION}
 COPY requirements.lock ./requirements.lock
 RUN python -m pip install --no-cache-dir --require-hashes -r requirements.lock

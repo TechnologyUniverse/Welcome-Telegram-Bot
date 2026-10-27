@@ -1,4 +1,4 @@
-"""Compatibility worker for Welcome Bot 1.6.1. Never starts Telegram polling.
+"""Compatibility worker for Welcome Bot 1.7.0. Never starts Telegram polling.
 
 Default SHADOW=true: no Telegram writes, storage polling, registry mutations,
 or legacy dispatch. Production requires an explicit cutover.

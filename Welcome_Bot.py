@@ -92,7 +92,7 @@ def log_event(event: str, **fields):
 
 # ================== VERSION ==================
 # Stable release version.
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 # v1.5.2 — Source → Badge (UX)
 # Branch 1.5.x started
 # Goal: user context, source attribution, badges, persistence preparation
@@ -2093,7 +2093,7 @@ async def main():
         f"delay={CFG.welcome_delay_seconds}s "
         f"autodelete={CFG.auto_delete_seconds}s"
     )
-    logging.info(f"BUILD | version={VERSION} channel=stable-1.6.x")
+    logging.info(f"BUILD | version={VERSION} channel=stable-1.7.x")
     if not CFG.admin_ids:
         logging.warning("ENV | ADMIN_IDS is empty")
 

@@ -334,5 +334,5 @@ def test_stale_lock_file_is_recoverable_after_process_exit(monkeypatch, tmp_path
     app.release_startup_lock()
 
 
-def test_version_constant_is_161():
-    assert app.VERSION == "1.6.1"
+def test_version_constant_is_170():
+    assert app.VERSION == "1.7.0"

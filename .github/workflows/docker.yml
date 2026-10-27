@@ -3,7 +3,7 @@ name: Publish container
 on:
   push:
     branches: [main]
-    tags: ['v1.6.1']
+    tags: ['v1.7.0']
 
 permissions:
   contents: read
@@ -52,6 +52,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
-            APP_VERSION=1.6.0
+            APP_VERSION=1.7.0
       - name: Report image digest
         run: 'echo "Published image digest: ${{ steps.build.outputs.digest }}"'

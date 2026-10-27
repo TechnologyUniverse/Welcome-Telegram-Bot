@@ -1,3 +1,9 @@
+# 1.7.0 — 2026-10-27
+
+- Add Apple release monitoring, cover generation, and publication with official version-specific notes.
+- Support Apple release notes for current and previous operating system generations.
+- Preserve release history and prevent duplicate or uncertain Telegram deliveries.
+
 # 1.6.1 — 2026-10-14
 
 - Add Storage Update Manager with persistent batching, scoped metadata feed, group-only announcements and covers.

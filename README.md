@@ -1,10 +1,10 @@
-## Release 1.6.1
+## Release 1.7.0
 
 Storage Update Manager is documented in [docs/storage-updates](docs/storage-updates/README.md). Notifications are opt-in; existing files are baselined without announcements.
 
 # Welcome Telegram Bot
 
-**Version:** `1.6.0`
+**Version:** `1.7.0`
 
 **Python:** `3.13.4`
 
@@ -57,7 +57,7 @@ To restore, stop the container first and make a separate copy of the current reg
 
 ## Docker
 
-The image uses `python:3.13.4-slim`, runs as UID/GID `10001`, and includes only the bot code and locked runtime dependencies. Build locally with `docker build -t welcome-telegram-bot:1.6.0 .`.
+The image uses `python:3.13.4-slim`, runs as UID/GID `10001`, and includes only the bot code and locked runtime dependencies. Build locally with `docker build -t welcome-telegram-bot:1.7.0 .`.
 
 `docker-compose.yml` is a standalone service. It has a read-only root filesystem, writable `/data` volume and `/tmp` tmpfs, dropped capabilities, `no-new-privileges`, CPU/RAM/PID limits, no published ports, and no Docker socket. It does not require PostgreSQL or Redis and is not joined to `novaryn-network`. Network access is outbound to Telegram Bot API over HTTPS.
 
@@ -71,7 +71,7 @@ Docker runs a local healthcheck against `/tmp/welcome_bot_health`, refreshed by 
 
 `ci.yml` runs on pull requests and `main`: locked dependency install, syntax check, unit tests, workflow YAML validation, Compose validation, patch whitespace check and a Docker build. CI does not publish or deploy.
 
-`docker.yml` verifies pushes to `main` and the `v1.6.0` tag, then publishes to GHCR. The tag produces `v1.6.0` and a full commit SHA tag (`sha-<full-commit>`); the workflow also prints the resulting image digest. Actions are pinned to full commit SHAs. It uses only `GITHUB_TOKEN` with `contents: read` and `packages: write`. No SSH deployment or VPS changes are configured.
+`docker.yml` verifies pushes to `main` and the `v1.7.0` tag, then publishes to GHCR. The tag produces `v1.7.0` and a full commit SHA tag (`sha-<full-commit>`); the workflow also prints the resulting image digest. Actions are pinned to full commit SHAs. It uses only `GITHUB_TOKEN` with `contents: read` and `packages: write`. No SSH deployment or VPS changes are configured.
 
 ## Production notes
 
