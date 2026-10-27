@@ -1,0 +1,11 @@
+--- bridge.py
++++ bridge.py
+@@ -203,6 +203,8 @@
+         tasks += [asyncio.create_task(legacy.cleanup_bot_messages()),asyncio.create_task(legacy.cleanup_caches()),asyncio.create_task(legacy.write_health_heartbeat())]
+         if legacy.storage_manager:
+             tasks.append(asyncio.create_task(legacy.storage_manager.run(legacy.shutdown_event)))
++        if legacy.apple_monitor:
++            tasks.append(asyncio.create_task(legacy.apple_monitor.run(legacy.shutdown_event)))
+     yield
+     legacy.shutdown_event.set()
+     for task in tasks:task.cancel()

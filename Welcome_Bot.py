@@ -1886,6 +1886,10 @@ async def get_photo_file_id(message: Message):
 from storage_adapter import install as install_storage_manager
 storage_manager = install_storage_manager(dp, bot, CFG.admin_ids, CFG.data_dir)
 
+# Apple monitor uses the existing bot; disabled by default until verified.
+from apple_release.adapter import install as install_apple_monitor
+apple_monitor = install_apple_monitor(dp, bot, CFG.admin_ids, CFG.data_dir)
+
 # Keyword trigger: "Хранилище".
 
 # Storage trigger anti-spam cache.
@@ -2106,6 +2110,7 @@ async def main():
     tasks = []
     if storage_manager is not None:
         tasks.append(asyncio.create_task(storage_manager.run(shutdown_event)))
+    tasks.append(asyncio.create_task(apple_monitor.run(shutdown_event)))
     tasks.append(asyncio.create_task(write_health_heartbeat()))
 
     # Cleanup tasks enabled in all modes (safe for test-mode)

@@ -1,0 +1,27 @@
+{
+  "approved": false,
+  "device_sha256": "82b39dcf25baa91c571b5cab612c3aea1922f2fa924e7ba983276c195df45f97",
+  "screens": [
+    {
+      "platform": "macOS",
+      "mask": "macos.png",
+      "sha256": "d9fc4c65d2c3c0597707d67004cadf9c0a4ec179129d68643c3dbf11141a834a"
+    },
+    {
+      "platform": "iPadOS",
+      "mask": "ipados.png",
+      "sha256": "2c3286cd23f2bbbb3e55f6d29843c278818da940cd8ca5a19030b55cc21b4ceb"
+    },
+    {
+      "platform": "iOS",
+      "mask": "ios.png",
+      "sha256": "d1c4b8f03b0daea33b6d49e350180b0bbcde02e5fcf8bf54eee2278caf9a0436"
+    },
+    {
+      "platform": "watchOS",
+      "mask": "watchos.png",
+      "sha256": "3b65d427bab1d46b75ab630a7d53042942908dd7a0fdbd924c6864a4ed2760c1"
+    }
+  ],
+  "note": "Draft geometry, visually inspect before approval."
+}
