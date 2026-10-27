@@ -3,6 +3,16 @@ import re
 from html.parser import HTMLParser
 
 PAGES = {
+    ('iOS', '26'): 'https://support.apple.com/ru-ru/123075',
+    ('iPadOS', '26'): 'https://support.apple.com/ru-ru/123074',
+    ('macOS', '26'): 'https://support.apple.com/ru-ru/122868',
+    ('watchOS', '26'): 'https://support.apple.com/ru-ru/123002',
+    ('visionOS', '26'): 'https://support.apple.com/ru-ru/123024',
+    ('iOS', '18'): 'https://support.apple.com/ru-ru/121161',
+    ('iPadOS', '18'): 'https://support.apple.com/ru-ru/121162',
+    ('macOS', '15'): 'https://support.apple.com/ru-ru/120283',
+    ('watchOS', '11'): 'https://support.apple.com/ru-ru/121163',
+    ('visionOS', '2'): 'https://support.apple.com/ru-ru/121164',
     ('iOS', '27'): 'https://support.apple.com/ru-ru/149076',
     ('iPadOS', '27'): 'https://support.apple.com/ru-ru/149075',
     ('macOS', '27'): 'https://support.apple.com/ru-ru/127257',

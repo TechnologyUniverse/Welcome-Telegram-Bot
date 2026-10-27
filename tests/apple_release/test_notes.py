@@ -6,6 +6,14 @@ def release(platform='iOS',version='27.2',kind='RELEASE',build='a'):
     return Release(platform,version,kind,None,build,'','','')
 
 class NotesTest(unittest.TestCase):
+    def test_previous_generations_have_separate_sources(self):
+        for platform, version, article in [('iOS','18.7','121161'), ('iPadOS','18.7','121162'),
+             ('macOS','15.7','120283'), ('watchOS','11.6','121163'), ('visionOS','2.6','121164'),
+             ('iOS','26.7','123075'), ('iPadOS','26.7','123074'), ('macOS','26.7','122868'),
+             ('watchOS','26.6','123002'), ('visionOS','26.6','123024')]:
+            with self.subTest(platform=platform, version=version):
+                self.assertTrue(page_for(release(platform,version)).endswith(article))
+        self.assertIsNone(page_for(release('macOS','18.1')))
     def test_exact_version_and_platform_page(self):
         raw=b'<h2>iOS 27.2</h2><p>Section heading</p><ul><li>A verified improvement for the correct version.</li></ul><h2>iOS 27.1</h2><ul><li>Old improvement should not appear.</li></ul>'
         self.assertEqual(extract(raw,release()),['A verified improvement for the correct version.'])
