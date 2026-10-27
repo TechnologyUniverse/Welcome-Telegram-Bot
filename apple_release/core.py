@@ -65,16 +65,31 @@ def parse_feed(raw: bytes, now: float | None = None) -> list[Release]:
         out.append(Release(PLATFORMS[platform.lower()],version,'RC' if rc_name else 'RELEASE',int(revision or 1) if rc_name else None,build,dt.astimezone(timezone.utc).isoformat(),source,source_id))
     return out
 
-def message_for(releases: list[Release]) -> str:
+def message_for(releases: list[Release], changes=None) -> str:
     if not releases: raise ValueError('empty_group')
+    changes=changes or {}
     types = {r.kind for r in releases}
     title = '🍎 Apple представила обновления программного обеспечения' if len(types)>1 else ('🍎 Apple выпустила Release Candidate' if 'RC' in types else '🍎 Apple выпустила обновления программного обеспечения')
     lines=[title,'']
+    seen=set()
     for r in releases:
+        identity=(r.platform,r.version,r.kind,r.rc)
+        if identity in seen: continue
+        seen.add(identity)
         suffix = f' RC{(" " + str(r.rc)) if r.rc and r.rc > 1 else ""}' if r.kind == 'RC' else ''
-        lines.append(f'• {r.platform} {r.version}{suffix}' + (f' · сборка {r.build}' if r.build else ''))
-    lines += ['', 'Подробный список изменений пока не подготовлен для публикации.', 'Сведения об обновлениях проверены по официальной ленте Apple.', '', 'Technology Universe | Новости технологий']
-    return '\n'.join(lines)
+        builds=', '.join(dict.fromkeys(x.build for x in releases if (x.platform,x.version,x.kind,x.rc)==identity and x.build))
+        lines.append(f'• {r.platform} {r.version}{suffix}' + (f' · сборка {builds}' if builds else ''))
+        matching=next((changes[x.key] for x in releases if (x.platform,x.version,x.kind,x.rc)==identity and changes.get(x.key)), [])
+        if matching: lines.append('  ' + matching[0])
+        else: lines.append('  Изменения Apple пока не опубликованы или недоступны.')
+    lines += ['', 'Источник: Apple. Некоторые сведения могут быть на языке оригинала.', '', 'Technology Universe | Новости технологий']
+    result='\n'.join(lines)
+    while len(result.encode('utf-16-le'))//2 > 1024:
+        index=next((i for i,line in reversed(list(enumerate(lines))) if line.startswith('  ') and line != '  Подробности не вошли в сообщение.'),None)
+        if index is None: break
+        lines[index]='  Подробности не вошли в сообщение.'
+        result='\n'.join(lines)
+    return result
 
 class ReleaseStore:
     def __init__(self, path: Path):

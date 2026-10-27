@@ -14,7 +14,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.types import BufferedInputFile
 from .core import FEED, MAX_FEED, Release, ReleaseStore, message_for, parse_feed
 from .cover import make_cover
-from . import library
+from . import library, notes
 
 log=logging.getLogger('welcome.apple_release')
 class Monitor:
@@ -69,7 +69,21 @@ class Monitor:
         key,releases=group
         try:
             photo=await asyncio.to_thread(self.render,releases)
-            body=message_for(releases)
+            changes={}
+            async with ClientSession(timeout=ClientTimeout(total=12)) as session:
+                async def get_notes(release):
+                    url=notes.page_for(release)
+                    if not url: return
+                    try:
+                        async with session.get(url, allow_redirects=False) as response:
+                            if response.status!=200: return
+                            raw=await response.content.read(2_000_001)
+                            found=notes.extract(raw, release)
+                            if found: changes[release.key]=found
+                    except Exception as exc:
+                        log.warning('Apple notes unavailable for %s: %s',release.platform,type(exc).__name__)
+                await asyncio.gather(*(get_notes(r) for r in releases))
+            body=message_for(releases, changes)
             if len(body.encode('utf-16-le'))//2 > 1024:
                 # Do not risk a partial multi-message publication; quarantine for review.
                 self.store.finish(key,'manual_review_required',error='caption_exceeds_limit');return
